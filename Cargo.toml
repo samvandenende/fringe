@@ -16,7 +16,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 num-complex = { version = "0.4.6", features = ["bytemuck"] }
 pollster = "0.4.0"
-pyo3 = { version = "0.29", features = ["num-complex", "extension-module"] }
+pyo3 = { version = "0.29", features = ["num-complex"] }
 wgpu = "29.0.3"
 rand = { version = "0.9.2", features = ["small_rng"] }
 rand_chacha = "0.9"
@@ -24,3 +24,4 @@ rustfft = "6.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 csv = "1.4.0"
+hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "complex"] }

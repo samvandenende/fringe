@@ -1,5 +1,9 @@
+use std::path::Path;
+
 use clap::Parser;
-use fringe::{self, Simulation, load_array, load_calibrator, load_sources}; // <-- use src/lib.rs
+use fringe::{self, Simulation, load_array, load_calibrator, load_sources};
+use hdf5::{File, Result};
+use num_complex::Complex32;
 
 fn parse_runtime(s: &str) -> Result<String, String> {
     let normalized = s.trim().to_ascii_lowercase();
@@ -43,6 +47,14 @@ struct Input {
     /// The calibrator model. File must be in JSON format.
     #[arg(short, long, value_name = "FILE")]
     calibrator: Option<String>,
+
+    /// File to write output to. Must be in HDF5 format if it exists. Otherwise a new file will be created.
+    #[arg(short, long, value_name = "FILE")]
+    output_file: String,
+
+    /// Name of dataset to use for the output
+    #[arg(short = 'd', long, value_name = "STRING")]
+    output_dataset: String,
 }
 
 fn main() {
@@ -70,5 +82,22 @@ fn main() {
     simulation.start();
     let result = simulation.finish();
 
-    println!("{:?}", result);
+    let outpath = Path::new(&input.output_file);
+    let output = if outpath.exists() {
+        File::open_rw(outpath).expect("Failed to open output file")
+    } else {
+        File::create(outpath).expect("Failed to create output file")
+    };
+
+    let rows = result.len();
+    let cols = result[0].len();
+    let flat = result.into_iter().flatten().collect::<Vec<_>>();
+
+    let dataset = output
+        .new_dataset::<Complex32>()
+        .shape((rows, cols))
+        .create(input.output_dataset.as_str())
+        .expect("Failed to create output dataset");
+
+    dataset.write(&flat).expect("Failed to write output");
 }
