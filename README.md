@@ -146,7 +146,7 @@ If no compatible GPU is available, the CPU backend can always be used.
 Clone the repository:
 
 ```bash
-git clone https://github.com/<username>/fringe.git
+git clone https://github.com/samvandenende/fringe.git
 cd fringe
 ```
 
