@@ -39,7 +39,7 @@ def sim_result_to_fftt_image(result):
     bin = round(IMAGE_FREQ * sample_window_size / sample_frequency)
     e_field = spectra[:, bin]
     image = np.fft.fftshift(np.fft.ifft2(e_field.reshape((32, 32))))
-    return np.abs(image)
+    return np.abs(image) ** 2
 
 
 def run():
