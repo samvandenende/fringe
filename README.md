@@ -58,6 +58,16 @@ The project consists of three interfaces built from the same Rust codebase.
 
 The simulation backend is shared between all three.
 
+## Web frontend
+
+[fringe-frontend](https://github.com/samvandenende/fringe-frontend) is a separate (experimental) browser-based
+environment built on the Rust library. It can be used to
+
+- configure the array, sky model and calibrator, and load or export them in fringe's file formats
+- run simulations on the CPU or GPU runtime
+- inspect the time-domain antenna samples, spectra and waterfalls
+- form beamformed sky images and compare them against the analytic expectation
+
 ---
 
 ## Execution backends
