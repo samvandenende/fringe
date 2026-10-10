@@ -3,6 +3,9 @@ const TAU: f32 = 6.283185307179586;
 struct Params {
     n_s: u32,
     stage: u32,
+    // +1 for an inverse FFT, -1 for a forward FFT
+    direction: f32,
+    _p: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -18,7 +21,7 @@ fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 }
 
 fn twiddle(k: u32, N: u32) -> vec2<f32> {
-    let angle = TAU * f32(k) / f32(N);
+    let angle = params.direction * TAU * f32(k) / f32(N);
     return vec2<f32>(cos(angle), sin(angle));
 }
 

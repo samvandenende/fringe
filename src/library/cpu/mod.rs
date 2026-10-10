@@ -10,7 +10,7 @@ use std::{
 
 use crate::library::normalize_and_truncate;
 
-use super::{Array, Calibrator, Phases, Source, Vec3, utils::fft_bin_frequency};
+use super::{Array, Phases, Source, Vec3, calibrator::CalibratorWindow, utils::fft_bin_frequency};
 
 /// Number of worker threads used to parallelize signal simulation.
 const NUM_CPUS: usize = 10;
@@ -23,6 +23,7 @@ type WorkerHandle = Option<JoinHandle<Vec<Vec<Complex32>>>>;
 pub(crate) struct Runtime {
     frequency_resolution: usize,
     fft_planner: FftPlanner<f32>,
+    calibrator_fft_planner: FftPlanner<f64>,
     workers: [WorkerHandle; NUM_CPUS],
 }
 
@@ -38,6 +39,7 @@ impl Runtime {
         Runtime {
             frequency_resolution,
             fft_planner: FftPlanner::new(),
+            calibrator_fft_planner: FftPlanner::new(),
             workers: [const { None }; NUM_CPUS],
         }
     }
@@ -51,14 +53,13 @@ impl Runtime {
     /// # Arguments
     /// - `array`: Antenna array configuration (positions, sampling parameters, etc.).
     /// - `sources`: List of signal sources contributing to the simulation.
-    /// - `calibrator`: Optional external calibrator.
-    /// - `phases`: Precomputed phase information for system noise, sources,
-    ///   and calibration signals.
+    /// - `calibrators`: Precomputed calibrator signals, if there are any calibrators.
+    /// - `phases`: Precomputed phase information for system noise and sources.
     pub(crate) fn start(
         &mut self,
         array: &Array,
         sources: &[Source],
-        calibrator: Option<&Calibrator>,
+        calibrators: Option<&Arc<CalibratorWindow>>,
         phases: &Phases,
     ) {
         let antennas_per_thread = array.antenna_positions.len().div_ceil(NUM_CPUS);
@@ -73,10 +74,8 @@ impl Runtime {
             let antenna_positions = array.antenna_positions[start..end].to_vec();
             let antennas_system_noise_phases =
                 phases.system_noise[(start * spectrum_size)..(end * spectrum_size)].to_vec();
-            let calibrator = calibrator
-                .cloned()
-                .unwrap_or(Calibrator::new(Vec3::new(0.0, 0.0, 1.0), 0.0));
             self.workers[i] = spawn_worker(
+                start,
                 antenna_positions,
                 array.sample_frequency,
                 array.downmix_frequency,
@@ -85,11 +84,11 @@ impl Runtime {
                 array.system_noise_intensity,
                 self.frequency_resolution,
                 sources.to_vec(),
-                calibrator,
+                calibrators.cloned(),
                 antennas_system_noise_phases,
                 phases.sources.clone(),
-                phases.calibrator_signal.clone(),
                 &mut self.fft_planner,
+                &mut self.calibrator_fft_planner,
             );
         }
     }
@@ -118,6 +117,7 @@ impl Runtime {
 ///
 /// # Arguments
 ///
+/// * `first_antenna` - Index of the first antenna assigned to this worker.
 /// * `antenna_positions` - Positions of the antennas assigned to this worker.
 /// * `sample_frequency` - ADC sample frequency in Hz.
 /// * `downmix_frequency` - Frequency used to downconvert the RF signal.
@@ -126,16 +126,17 @@ impl Runtime {
 /// * `system_noise_intensity` - Receiver system noise spectral density.
 /// * `frequency_resolution` - FFT oversampling factor.
 /// * `sources` - Astronomical sources to simulate.
-/// * `calibrator` - Calibration source.
+/// * `calibrators` - Precomputed calibrator signals, if there are any calibrators.
 /// * `antennas_system_noise_phases` - Per-antenna receiver noise phases.
 /// * `source_phases` - Precomputed random phases for the astronomical sources.
-/// * `calibrator_signal_phases` - Precomputed random phases for the calibrator.
 /// * `fft_planner` - FFT planner used to construct the inverse FFT.
+/// * `calibrator_fft_planner` - FFT planner used to construct the calibrator FFT.
 ///
 /// # Returns
 ///
 /// A handle to the spawned worker thread.
 fn spawn_worker(
+    first_antenna: usize,
     antenna_positions: Vec<Vec3>,
     sample_frequency: f64,
     downmix_frequency: f64,
@@ -144,19 +145,23 @@ fn spawn_worker(
     system_noise_intensity: f64,
     frequency_resolution: usize,
     sources: Vec<Source>,
-    calibrator: Calibrator,
+    calibrators: Option<Arc<CalibratorWindow>>,
     antennas_system_noise_phases: Vec<f32>,
     source_phases: Arc<Vec<f32>>,
-    calibrator_signal_phases: Arc<Vec<f32>>,
     fft_planner: &mut FftPlanner<f32>,
+    calibrator_fft_planner: &mut FftPlanner<f64>,
 ) -> WorkerHandle {
-    let fft = fft_planner.plan_fft_inverse(sample_window_size * frequency_resolution);
+    let spectrum_size = sample_window_size * frequency_resolution;
+    let fft = fft_planner.plan_fft_inverse(spectrum_size);
+    let calibrator_fft = calibrator_fft_planner.plan_fft_forward(spectrum_size);
     Some(thread::spawn(move || {
         antennas_system_noise_phases
-            .chunks(sample_window_size * frequency_resolution)
+            .chunks(spectrum_size)
             .zip(antenna_positions)
-            .map(|(antenna_system_noise_phases, position)| {
+            .enumerate()
+            .map(|(i, (antenna_system_noise_phases, position))| {
                 simulate_sample_window(
+                    first_antenna + i,
                     position,
                     sample_frequency,
                     downmix_frequency,
@@ -165,11 +170,11 @@ fn spawn_worker(
                     system_noise_intensity,
                     frequency_resolution,
                     &sources,
-                    &calibrator,
+                    calibrators.as_deref(),
                     antenna_system_noise_phases,
                     &source_phases,
-                    &calibrator_signal_phases,
                     &fft,
+                    &calibrator_fft,
                 )
             })
             .collect::<Vec<_>>()
@@ -184,6 +189,7 @@ fn spawn_worker(
 ///
 /// # Arguments
 ///
+/// * `antenna` - Index of the antenna in the array.
 /// * `antenna_position` - Cartesian position of the antenna.
 /// * `sample_frequency` - ADC sample frequency in Hz.
 /// * `downmix_frequency` - Frequency used to downconvert the RF signal to baseband.
@@ -192,18 +198,17 @@ fn spawn_worker(
 /// * `system_noise_intensity` - Receiver system noise spectral density.
 /// * `frequency_resolution` - FFT oversampling factor.
 /// * `sources` - Astronomical sources to simulate.
-/// * `calibrator` - Optional calibration source.
+/// * `calibrators` - Precomputed calibrator signals, if there are any calibrators.
 /// * `antenna_system_noise_phases` - Random phases for receiver noise.
 /// * `source_phases` - Precomputed random phases for all simulated sources.
-/// * `calibrator_signal_phases` - Precomputed random phases for the calibrator.
 /// * `fft` - Inverse FFT plan used to transform the synthesized spectrum.
+/// * `calibrator_fft` - Forward FFT plan used to transform the calibrator signals.
 ///
 /// # Returns
 ///
-/// A vector containing the simulated complex///
-/// Each antenna is simulated independently and converted from the frequency
-/// domain to the time domain using a shared inverse FFT plan. time-domain samples.
+/// A vector containing the simulated complex time-domain samples.
 fn simulate_sample_window(
+    antenna: usize,
     antenna_position: Vec3,
     sample_frequency: f64,
     downmix_frequency: f64,
@@ -212,14 +217,15 @@ fn simulate_sample_window(
     system_noise_intensity: f64,
     frequency_resolution: usize,
     sources: &[Source],
-    calibrator: &Calibrator,
+    calibrators: Option<&CalibratorWindow>,
     antenna_system_noise_phases: &[f32],
     source_phases: &[f32],
-    calibrator_signal_phases: &[f32],
     fft: &Arc<dyn Fft<f32>>,
+    calibrator_fft: &Arc<dyn Fft<f64>>,
 ) -> Vec<Complex32> {
     let spectrum_size = sample_window_size * frequency_resolution;
     let mut simulated_spectrum = simulate_spectrum(
+        antenna,
         antenna_position,
         sample_frequency,
         downmix_frequency,
@@ -227,10 +233,10 @@ fn simulate_sample_window(
         spectrum_size,
         system_noise_intensity,
         sources,
-        calibrator,
+        calibrators,
         antenna_system_noise_phases,
         source_phases,
-        calibrator_signal_phases,
+        calibrator_fft,
     );
     fft.process(&mut simulated_spectrum); // in-place FFT, simulated_spectrum now contains time domain samples
     normalize_and_truncate(&simulated_spectrum, sample_window_size)
@@ -238,11 +244,12 @@ fn simulate_sample_window(
 
 /// Synthesizes the frequency-domain spectrum for a single antenna.
 ///
-/// The synthesized spectrum is the sum of receiver system noise, the optional
-/// calibration source, and all sky source contributions.
+/// The synthesized spectrum is the sum of receiver system noise, the
+/// calibrators, and all sky source contributions.
 ///
 /// # Arguments
 ///
+/// * `antenna` - Index of the antenna in the array.
 /// * `antenna_position` - Cartesian position of the antenna.
 /// * `sample_frequency` - ADC sample frequency in Hz.
 /// * `downmix_frequency` - Frequency used to downconvert the RF signal to baseband.
@@ -250,15 +257,16 @@ fn simulate_sample_window(
 /// * `spectrum_size` - Number of frequency bins to synthesize.
 /// * `system_noise_intensity` - Receiver system noise spectral density.
 /// * `sources` - Astronomical sources to simulate.
-/// * `calibrator` - Calibration source.
+/// * `calibrators` - Precomputed calibrator signals, if there are any calibrators.
 /// * `antenna_system_noise_phases` - Random phases for receiver noise.
 /// * `source_phases` - Precomputed random phases for all simulated sources.
-/// * `calibrator_signal_phases` - Precomputed random phases for the calibrator.
+/// * `calibrator_fft` - Forward FFT plan used to transform the calibrator signals.
 ///
 /// # Returns
 ///
 /// A synthesized complex spectrum suitable for inverse FFT processing.
 fn simulate_spectrum(
+    antenna: usize,
     antenna_position: Vec3,
     sample_frequency: f64,
     downmix_frequency: f64,
@@ -266,10 +274,10 @@ fn simulate_spectrum(
     spectrum_size: usize,
     system_noise_intensity: f64,
     sources: &[Source],
-    calibrator: &Calibrator,
+    calibrators: Option<&CalibratorWindow>,
     antenna_system_noise_phases: &[f32],
     source_phases: &[f32],
-    calibrator_signal_phases: &[f32],
+    calibrator_fft: &Arc<dyn Fft<f64>>,
 ) -> Vec<Complex32> {
     let mut spectrum = vec![Complex64::ZERO; spectrum_size];
     let bandpass_index_min =
@@ -288,16 +296,16 @@ fn simulate_spectrum(
         antenna_system_noise_phases,
     );
 
-    simulate_spectrum_calibrator_contribution(
-        &mut spectrum,
-        antenna_position,
-        sample_frequency,
-        bandpass_index_min,
-        bandpass_index_max,
-        spectrum_size,
-        calibrator,
-        calibrator_signal_phases,
-    );
+    if let Some(calibrators) = calibrators {
+        simulate_spectrum_calibrator_contributions(
+            &mut spectrum,
+            antenna,
+            bandpass_index_min,
+            bandpass_index_max,
+            calibrators,
+            calibrator_fft,
+        );
+    }
 
     simulate_spectrum_source_contributions(
         &mut spectrum,
@@ -360,48 +368,40 @@ fn simulate_spectrum_system_noise_contribution(
     }
 }
 
-/// Adds the calibration source contribution to a synthesized spectrum.
+/// Adds the contributions from all calibrators to a synthesized spectrum.
 ///
-/// The calibrator is modeled as a point source with free-space propagation,
-/// geometric delay, and a uniform gain pattern.
+/// The calibrator signals are evaluated in the time domain, transformed to the
+/// frequency domain and added within the bandpass, so that they are filtered
+/// exactly like the sky.
 ///
 /// # Arguments
 ///
 /// * `spectrum` - Spectrum to modify in place.
-/// * `antenna_position` - Cartesian position of the antenna.
-/// * `sample_frequency` - ADC sample frequency in Hz.
+/// * `antenna` - Index of the antenna in the array.
 /// * `bandpass_index_min` - First frequency bin included in the bandpass.
 /// * `bandpass_index_max` - Last frequency bin included in the bandpass.
-/// * `spectrum_size` - Total number of frequency bins.
-/// * `calibrator` - Calibration source.
-/// * `calibrator_signal_phases` - Random phase assigned to each frequency bin.
-fn simulate_spectrum_calibrator_contribution(
+/// * `calibrators` - Precomputed calibrator signals.
+/// * `calibrator_fft` - Forward FFT plan used to transform the calibrator signals.
+fn simulate_spectrum_calibrator_contributions(
     spectrum: &mut [Complex64],
-    antenna_position: Vec3,
-    sample_frequency: f64,
+    antenna: usize,
     bandpass_index_min: usize,
     bandpass_index_max: usize,
-    spectrum_size: usize,
-    calibrator: &Calibrator,
-    calibrator_signal_phases: &[f32],
+    calibrators: &CalibratorWindow,
+    calibrator_fft: &Arc<dyn Fft<f64>>,
 ) {
-    let calibrator_direction = calibrator.position - antenna_position;
-    let calibrator_distance = calibrator_direction.norm();
-    let calibrator_direction_z = (calibrator_direction / calibrator_distance).z;
-    let calibrator_gain = calibrator_direction_z * calibrator_direction_z;
-    let sqrt_amplitude =
-        (calibrator_gain * calibrator.intensity / (2.0 * TAU)).sqrt() / calibrator_distance;
-    let delay = calibrator_distance / C;
-    for ((index, spectrum_value), phase) in spectrum
+    // The antenna gain does not depend on frequency, so all calibrators can share one FFT.
+    let mut signal = calibrators.antenna_signal(antenna);
+    calibrator_fft.process(&mut signal);
+    // undo the scaling of the inverse FFT and the normalization of the output samples
+    let scale = (spectrum.len() as f64).sqrt().recip();
+    for (spectrum_value, value) in spectrum
         .iter_mut()
-        .enumerate()
-        .zip(calibrator_signal_phases)
+        .zip(signal)
         .take(bandpass_index_max + 1)
         .skip(bandpass_index_min)
     {
-        let bin_frequency = fft_bin_frequency(spectrum_size, sample_frequency, index);
-        let phase = *phase as f64 + (TAU * bin_frequency * delay);
-        *spectrum_value += Complex64::from_polar(sqrt_amplitude, phase);
+        *spectrum_value += value * scale;
     }
 }
 

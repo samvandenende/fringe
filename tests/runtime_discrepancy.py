@@ -240,6 +240,57 @@ def test_many_sources(
     show_results(samples_cpu, samples_gpu)
 
 
+def test_calibrators(
+    sample_frequency=120e6,
+    downmix_frequency=45e6,
+    bandpass_fmin=5e6,
+    bandpass_fmax=55e6,
+    sample_window_size=2**12,
+    frequency_resolution=4,
+):
+    antenna_position = fr.Vec3(0.0, 0.0, 0.0)
+    array = fr.Array(
+        [antenna_position],
+        sample_frequency,
+        downmix_frequency,
+        bandpass_fmin,
+        bandpass_fmax,
+        sample_window_size,
+        0.0,
+    )
+
+    sim_cpu = fr.Simulation("cpu", array, frequency_resolution, 42)
+    sim_gpu = fr.Simulation("gpu", array, frequency_resolution, 42)
+
+    rng = np.random.default_rng(42)
+    noise = fr.Transmitter(
+        frequency=60e6,
+        sample_rate=40e6,
+        power=10.0,
+        buffer=np.exp(2j * np.pi * rng.random(1000)).astype(np.complex64),
+        bandwidth=30e6,
+    )
+    tone = fr.Transmitter(frequency=80e6, sample_rate=1e6, power=1.0, buffer=[1.0])
+    calibrators = [
+        fr.Calibrator(
+            fr.Vec3(1e4, 2e4, 1e5),
+            noise,
+            velocity=fr.Vec3(1600.0, -300.0, 10.0),
+            acceleration=fr.Vec3(0.0, 0.0, -25.0),
+        ),
+        fr.Calibrator(fr.Vec3(-3e4, 0.0, 2e5), tone, velocity=fr.Vec3(-200.0, 1500.0, 0.0)),
+    ]
+    sim_cpu.set_calibrators(calibrators)
+    sim_gpu.set_calibrators(calibrators)
+
+    sim_cpu.start(0.75)
+    sim_gpu.start(0.75)
+    samples_cpu = np.array(sim_cpu.finish()[0])
+    samples_gpu = np.array(sim_gpu.finish()[0])
+
+    show_results(samples_cpu, samples_gpu)
+
+
 print("=== System noise only ===")
 test_system_noise()
 print("")
@@ -248,3 +299,6 @@ test_source()
 print("")
 print("=== Many sources ===")
 test_many_sources()
+print("")
+print("=== Calibrators only ===")
+test_calibrators()

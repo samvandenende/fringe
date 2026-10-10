@@ -1,5 +1,7 @@
 use crate::Vec3;
+use num_complex::Complex32;
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 /// Array model and its signal acquisition parameters.
 ///
@@ -244,15 +246,202 @@ impl Source {
     }
 }
 
+/// Transmitter of a calibrator, configured like a software defined radio.
+///
+/// The transmitter plays its complex baseband buffer cyclically at `sample_rate`,
+/// upconverted to the carrier `frequency`. Buffer samples are relative levels, like
+/// the full scale of a DAC: `power` is the radiated power for a buffer with unit RMS.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct Transmitter {
+    pub(crate) frequency: f64,
+    pub(crate) sample_rate: f64,
+    pub(crate) power: f64,
+    pub(crate) bandwidth: Option<f64>,
+    pub(crate) buffer: Arc<[Complex32]>,
+    pub(crate) start_time: f64,
+}
+
+#[pymethods]
+impl Transmitter {
+    /// Creates a new transmitter.
+    ///
+    /// # Arguments
+    /// - `frequency`: Carrier frequency (Hz).
+    /// - `sample_rate`: Rate at which buffer samples are played out (Hz).
+    /// - `power`: Equivalent isotropically radiated power (W) for a buffer with unit RMS.
+    /// - `buffer`: Complex baseband samples, transmitted cyclically.
+    /// - `bandwidth`: Optional bandwidth of the reconstruction filter (Hz).
+    /// - `start_time`: Time (s) at which the first buffer sample is transmitted.
+    ///
+    /// # Panics
+    /// Panics if:
+    /// - frequency is negative
+    /// - sample_rate is not positive
+    /// - power is negative
+    /// - bandwidth is not positive
+    /// - buffer is empty or contains non-finite samples
+    #[new]
+    #[pyo3(signature = (frequency, sample_rate, power, buffer, bandwidth = None, start_time = 0.0))]
+    pub fn new(
+        frequency: f64,
+        sample_rate: f64,
+        power: f64,
+        buffer: Vec<Complex32>,
+        bandwidth: Option<f64>,
+        start_time: f64,
+    ) -> Self {
+        let transmitter = Transmitter {
+            frequency,
+            sample_rate,
+            power,
+            bandwidth,
+            buffer: buffer.into(),
+            start_time,
+        };
+        transmitter.validate();
+        transmitter
+    }
+
+    /// Returns the carrier frequency in Hz.
+    pub fn frequency(&self) -> f64 {
+        self.frequency
+    }
+
+    /// Returns the rate in Hz at which buffer samples are played out.
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// Returns the radiated power in W for a buffer with unit RMS.
+    pub fn power(&self) -> f64 {
+        self.power
+    }
+
+    /// Returns the bandwidth of the reconstruction filter in Hz, if any.
+    pub fn bandwidth(&self) -> Option<f64> {
+        self.bandwidth
+    }
+
+    /// Returns the transmitted buffer.
+    pub fn buffer(&self) -> Vec<Complex32> {
+        self.buffer.to_vec()
+    }
+
+    /// Returns the time in s at which the first buffer sample is transmitted.
+    pub fn start_time(&self) -> f64 {
+        self.start_time
+    }
+
+    /// Sets the carrier frequency in Hz.
+    ///
+    /// # Panics
+    /// Panics if frequency is negative.
+    pub fn set_frequency(&mut self, frequency: f64) {
+        self.frequency = frequency;
+        self.validate();
+    }
+
+    /// Sets the rate in Hz at which buffer samples are played out.
+    ///
+    /// # Panics
+    /// Panics if sample_rate is not positive.
+    pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate;
+        self.validate();
+    }
+
+    /// Sets the radiated power in W for a buffer with unit RMS.
+    ///
+    /// # Panics
+    /// Panics if power is negative.
+    pub fn set_power(&mut self, power: f64) {
+        self.power = power;
+        self.validate();
+    }
+
+    /// Sets the bandwidth of the reconstruction filter in Hz, or removes the filter with `None`.
+    ///
+    /// # Panics
+    /// Panics if bandwidth is not positive.
+    #[pyo3(signature = (bandwidth = None))]
+    pub fn set_bandwidth(&mut self, bandwidth: Option<f64>) {
+        self.bandwidth = bandwidth;
+        self.validate();
+    }
+
+    /// Sets the buffer that is transmitted cyclically.
+    ///
+    /// # Panics
+    /// Panics if buffer is empty or contains non-finite samples.
+    pub fn set_buffer(&mut self, buffer: Vec<Complex32>) {
+        self.buffer = buffer.into();
+        self.validate();
+    }
+
+    /// Sets the time in s at which the first buffer sample is transmitted.
+    ///
+    /// # Panics
+    /// Panics if start_time is not finite.
+    pub fn set_start_time(&mut self, start_time: f64) {
+        self.start_time = start_time;
+        self.validate();
+    }
+
+    fn __repr__(&self) -> String {
+        let bandwidth = self
+            .bandwidth
+            .map_or("None".to_string(), |b| format!("{:.2}MHz", b / 1e6));
+        format!(
+            "Transmitter(frequency = {:.2}MHz, sample_rate = {:.2}MHz, power = {}W, bandwidth = {}, buffer = [...{} samples...], start_time = {}s)",
+            self.frequency / 1e6,
+            self.sample_rate / 1e6,
+            self.power,
+            bandwidth,
+            self.buffer.len(),
+            self.start_time
+        )
+    }
+
+    pub(crate) fn validate(&self) {
+        assert!(
+            self.frequency.is_finite() && self.frequency >= 0.0,
+            "frequency must be non-negative"
+        );
+        assert!(
+            self.sample_rate.is_finite() && self.sample_rate > 0.0,
+            "sample_rate must be positive"
+        );
+        assert!(
+            self.power.is_finite() && self.power >= 0.0,
+            "power must be non-negative"
+        );
+        assert!(
+            self.bandwidth.is_none_or(|b| b.is_finite() && b > 0.0),
+            "bandwidth must be positive"
+        );
+        assert!(!self.buffer.is_empty(), "buffer must not be empty");
+        assert!(
+            self.buffer.iter().all(|s| s.is_finite()),
+            "buffer must only contain finite samples"
+        );
+        assert!(self.start_time.is_finite(), "start_time must be finite");
+    }
+}
+
 /// Calibrator used to model a known reference emitter (e.g. a satellite).
 ///
-/// The calibrator acts as a deterministic signal source which can
-/// be used for system calibration.
+/// The calibrator transmits a deterministic signal from a position that moves
+/// with constant acceleration:
+/// `p(t) = position + velocity * (t - epoch) + acceleration * (t - epoch)^2 / 2`.
 #[pyclass(from_py_object)]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 pub struct Calibrator {
     pub(crate) position: Vec3,
-    pub(crate) intensity: f64,
+    pub(crate) velocity: Vec3,
+    pub(crate) acceleration: Vec3,
+    pub(crate) epoch: f64,
+    pub(crate) transmitter: Transmitter,
 }
 
 #[pymethods]
@@ -260,39 +449,118 @@ impl Calibrator {
     /// Creates a new calibrator.
     ///
     /// # Arguments
-    /// - `position`: Position of the calibration source.
-    /// - `intensity`: Signal intensity of the calibrator.
+    /// - `position`: Position (m) of the calibrator at `epoch`.
+    /// - `transmitter`: Transmitter of the calibrator.
+    /// - `velocity`: Velocity (m/s) at `epoch`, zero if not given.
+    /// - `acceleration`: Constant acceleration (m/s²), zero if not given.
+    /// - `epoch`: Time (s) at which `position` and `velocity` are valid.
     ///
     /// # Panics
-    /// Panics if intensity is negative.
+    /// Panics if any of the kinematic parameters is not finite.
     #[new]
-    pub fn new(position: Vec3, intensity: f64) -> Self {
+    #[pyo3(signature = (position, transmitter, velocity = None, acceleration = None, epoch = 0.0))]
+    pub fn new(
+        position: Vec3,
+        transmitter: Transmitter,
+        velocity: Option<Vec3>,
+        acceleration: Option<Vec3>,
+        epoch: f64,
+    ) -> Self {
         let calibrator = Calibrator {
             position,
-            intensity,
+            velocity: velocity.unwrap_or_default(),
+            acceleration: acceleration.unwrap_or_default(),
+            epoch,
+            transmitter,
         };
         calibrator.validate();
         calibrator
     }
 
-    /// Returns the calibrator position.
+    /// Returns the calibrator position at `epoch`.
     pub fn position(&self) -> Vec3 {
         self.position
     }
 
-    /// Returns the calibrator intensity.
-    pub fn intensity(&self) -> f64 {
-        self.intensity
+    /// Returns the calibrator velocity at `epoch`.
+    pub fn velocity(&self) -> Vec3 {
+        self.velocity
+    }
+
+    /// Returns the calibrator acceleration.
+    pub fn acceleration(&self) -> Vec3 {
+        self.acceleration
+    }
+
+    /// Returns the time at which `position` and `velocity` are valid.
+    pub fn epoch(&self) -> f64 {
+        self.epoch
+    }
+
+    /// Returns the calibrator's transmitter.
+    pub fn transmitter(&self) -> Transmitter {
+        self.transmitter.clone()
+    }
+
+    /// Replaces the kinematic state of the calibrator.
+    ///
+    /// # Arguments
+    /// - `position`: Position (m) at `epoch`.
+    /// - `velocity`: Velocity (m/s) at `epoch`, zero if not given.
+    /// - `acceleration`: Constant acceleration (m/s²), zero if not given.
+    /// - `epoch`: Time (s) at which `position` and `velocity` are valid.
+    ///
+    /// # Panics
+    /// Panics if any of the kinematic parameters is not finite.
+    #[pyo3(signature = (position, velocity = None, acceleration = None, epoch = 0.0))]
+    pub fn set_state(
+        &mut self,
+        position: Vec3,
+        velocity: Option<Vec3>,
+        acceleration: Option<Vec3>,
+        epoch: f64,
+    ) {
+        self.position = position;
+        self.velocity = velocity.unwrap_or_default();
+        self.acceleration = acceleration.unwrap_or_default();
+        self.epoch = epoch;
+        self.validate();
+    }
+
+    /// Replaces the calibrator's transmitter.
+    pub fn set_transmitter(&mut self, transmitter: Transmitter) {
+        self.transmitter = transmitter;
+    }
+
+    /// Computes the calibrator position at a given time.
+    ///
+    /// # Arguments
+    /// - `time`: Time (s).
+    ///
+    /// # Returns
+    /// The position (m) at `time`.
+    pub fn position_at(&self, time: f64) -> Vec3 {
+        let dt = time - self.epoch;
+        self.position + self.velocity * dt + self.acceleration * (0.5 * dt * dt)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Calibrator(position = {:?}, intensity = {})",
-            self.position, self.intensity
+            "Calibrator(position = {}, velocity = {}, acceleration = {}, epoch = {}s, transmitter = {})",
+            self.position.__repr__(),
+            self.velocity.__repr__(),
+            self.acceleration.__repr__(),
+            self.epoch,
+            self.transmitter.__repr__()
         )
     }
 
     pub(crate) fn validate(&self) {
-        assert!(self.intensity >= 0.0, "intensity must be non-negative");
+        let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        assert!(finite(self.position), "position must be finite");
+        assert!(finite(self.velocity), "velocity must be finite");
+        assert!(finite(self.acceleration), "acceleration must be finite");
+        assert!(self.epoch.is_finite(), "epoch must be finite");
+        self.transmitter.validate();
     }
 }

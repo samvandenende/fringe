@@ -1,4 +1,4 @@
-use crate::{Array, Calibrator, Source};
+use crate::{Array, Calibrator, Source, Transmitter};
 use csv::{ReaderBuilder, WriterBuilder};
 use num_complex::Complex32;
 use pyo3::PyResult;
@@ -6,11 +6,12 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use std::f32::consts::TAU;
 use std::ops::{Add, Div, Mul, Sub};
+use std::path::Path;
 use std::sync::Arc;
 
 /// 3D Cartesian vector
 #[pyclass(from_py_object)]
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vec3 {
     #[pyo3(get, set)]
     pub x: f64,
@@ -229,12 +230,9 @@ impl Div<f64> for Vec3 {
 /// This structure stores random phase offsets for:
 /// - system noise per antenna
 /// - per-source spectral phases
-/// - deterministic calibrator signal
 pub(crate) struct Phases {
     pub(crate) system_noise: Vec<f32>,
     pub(crate) sources: Arc<Vec<f32>>,
-    pub(crate) calibrator_signal: Arc<Vec<f32>>,
-    _original_calibrator_signal: Vec<f32>,
 }
 
 impl Phases {
@@ -254,17 +252,9 @@ impl Phases {
         num_sources: usize,
         frequency_resolution: usize,
     ) -> Self {
-        let num_spectrum_bins = array.sample_window_size * frequency_resolution;
-
-        let calibrator_signal = (0..num_spectrum_bins)
-            .map(|_| rng.random_range(0.0..TAU))
-            .collect::<Vec<f32>>();
-
         let mut phases = Phases {
             system_noise: Vec::new(),
             sources: Arc::new(Vec::new()),
-            calibrator_signal: Arc::new(Vec::new()),
-            _original_calibrator_signal: calibrator_signal,
         };
 
         phases.update(rng, array, num_sources, frequency_resolution);
@@ -277,7 +267,6 @@ impl Phases {
     /// This regenerates:
     /// - system noise phases per antenna
     /// - per-source spectral phases
-    /// - time-shifted calibrator signal phases
     ///
     /// # Arguments
     /// - `rng`: Random number generator
@@ -304,17 +293,6 @@ impl Phases {
                 .map(|_| rng.random_range(0.0..TAU))
                 .collect(),
         );
-
-        assert_eq!(self._original_calibrator_signal.len(), num_spectrum_bins);
-        let mut calibrator_signal = self._original_calibrator_signal.clone();
-        let cal_signal_period = num_spectrum_bins as f64 / array.sample_frequency;
-        let time_delay = rng.random::<f64>() * cal_signal_period;
-        for (i, phase) in calibrator_signal.iter_mut().enumerate() {
-            use std::f64::consts::TAU;
-            let freq = fft_bin_frequency(num_spectrum_bins, array.sample_frequency, i);
-            *phase += ((TAU * freq * time_delay) % TAU) as f32;
-        }
-        self.calibrator_signal = Arc::new(calibrator_signal);
     }
 }
 
@@ -491,53 +469,207 @@ pub fn load_sources(filepath: &str) -> PyResult<Vec<Source>> {
     Ok(sources)
 }
 
-/// Saves the calibrator to a file in JSON format.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CalibratorJson {
+    position: Vec3,
+    #[serde(default)]
+    velocity: Vec3,
+    #[serde(default)]
+    acceleration: Vec3,
+    #[serde(default)]
+    epoch: f64,
+    transmitter: TransmitterJson,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransmitterJson {
+    frequency: f64,
+    sample_rate: f64,
+    power: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<f64>,
+    #[serde(default)]
+    start_time: f64,
+    /// Path of the buffer file, relative to the calibrators file.
+    buffer: String,
+}
+
+/// Saves a list of calibrators to a file in JSON format.
+///
+/// The transmit buffers are written next to it as raw interleaved little-endian
+/// 32-bit float IQ files (`cf32_le`), named `<file stem>.<index>.cf32`.
+/// Calibrators sharing a buffer share a buffer file.
 ///
 /// # Arguments
-/// - `calibrator`: The calibrator.
-/// - `filepath`: Destination path where the calibrator will be written.
+/// - `calibrators`: The list of calibrators.
+/// - `filepath`: Destination path where the calibrators will be written.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be created or written
+/// Returns a Python `IOError` if a file cannot be created or written
 #[pyfunction]
-pub fn save_calibrator(calibrator: &Calibrator, filepath: &str) -> PyResult<()> {
-    let file = std::fs::File::create(filepath)
+pub fn save_calibrators(calibrators: Vec<Calibrator>, filepath: &str) -> PyResult<()> {
+    let path = Path::new(filepath);
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| PyIOError::new_err(format!("Invalid file path '{}'", filepath)))?
+        .to_string_lossy();
+
+    let mut buffer_files: Vec<(Arc<[Complex32]>, String)> = Vec::new();
+    let mut entries = Vec::with_capacity(calibrators.len());
+    for calibrator in calibrators {
+        let transmitter = &calibrator.transmitter;
+        let existing = buffer_files
+            .iter()
+            .find(|(buffer, _)| Arc::ptr_eq(buffer, &transmitter.buffer));
+        let buffer_file = match existing {
+            Some((_, name)) => name.clone(),
+            None => {
+                let name = format!("{}.{}.cf32", stem, buffer_files.len());
+                write_cf32(&directory.join(&name), &transmitter.buffer)?;
+                buffer_files.push((transmitter.buffer.clone(), name.clone()));
+                name
+            }
+        };
+        entries.push(CalibratorJson {
+            position: calibrator.position,
+            velocity: calibrator.velocity,
+            acceleration: calibrator.acceleration,
+            epoch: calibrator.epoch,
+            transmitter: TransmitterJson {
+                frequency: transmitter.frequency,
+                sample_rate: transmitter.sample_rate,
+                power: transmitter.power,
+                bandwidth: transmitter.bandwidth,
+                start_time: transmitter.start_time,
+                buffer: buffer_file,
+            },
+        });
+    }
+
+    let file = std::fs::File::create(path)
         .map_err(|e| PyIOError::new_err(format!("Failed to create file '{}': {}", filepath, e)))?;
 
     let writer = std::io::BufWriter::new(file);
 
-    serde_json::to_writer_pretty(writer, calibrator)
-        .map_err(|e| PyIOError::new_err(format!("Failed to serialize Array: {}", e)))?;
+    serde_json::to_writer_pretty(writer, &entries)
+        .map_err(|e| PyIOError::new_err(format!("Failed to serialize calibrators: {}", e)))?;
 
     Ok(())
 }
 
-/// Loads a calibrator from a JSON file.
+/// Loads a list of calibrators from a JSON file.
 ///
 /// # Arguments
-/// - `filepath`: Path to the file containing a serialized `Calibrator`.
+/// - `filepath`: Path to the file containing a serialized list of `Calibrator`s.
 ///
 /// # Returns
-/// A reconstructed `Calibrator` instance.
+/// A reconstructed list of `Calibrator`s.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be read or parsed.
+/// Returns a Python `IOError` if a file cannot be read or parsed.
 ///
 /// # Panics
-/// Panics if intensity is negative.
+/// Panics if, for a `Calibrator`:
+/// - a kinematic parameter is not finite
+/// - a transmitter parameter is invalid
 #[pyfunction]
-pub fn load_calibrator(filepath: &str) -> PyResult<Calibrator> {
-    let file = std::fs::File::open(filepath)
+pub fn load_calibrators(filepath: &str) -> PyResult<Vec<Calibrator>> {
+    let path = Path::new(filepath);
+    let directory = path.parent().unwrap_or(Path::new(""));
+
+    let file = std::fs::File::open(path)
         .map_err(|e| PyIOError::new_err(format!("Failed to open file '{}': {}", filepath, e)))?;
 
     let reader = std::io::BufReader::new(file);
 
-    let calibrator: Calibrator = serde_json::from_reader(reader)
-        .map_err(|e| PyIOError::new_err(format!("Failed to deserialize Array: {}", e)))?;
+    let entries: Vec<CalibratorJson> = serde_json::from_reader(reader)
+        .map_err(|e| PyIOError::new_err(format!("Failed to deserialize calibrators: {}", e)))?;
 
-    calibrator.validate();
+    let mut buffers: Vec<(String, Arc<[Complex32]>)> = Vec::new();
+    let mut calibrators = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry.transmitter.buffer;
+        let buffer = match buffers.iter().find(|(n, _)| *n == name) {
+            Some((_, buffer)) => buffer.clone(),
+            None => {
+                let buffer: Arc<[Complex32]> = read_cf32(&directory.join(&name))?.into();
+                buffers.push((name, buffer.clone()));
+                buffer
+            }
+        };
+        let transmitter = Transmitter {
+            frequency: entry.transmitter.frequency,
+            sample_rate: entry.transmitter.sample_rate,
+            power: entry.transmitter.power,
+            bandwidth: entry.transmitter.bandwidth,
+            buffer,
+            start_time: entry.transmitter.start_time,
+        };
+        let calibrator = Calibrator {
+            position: entry.position,
+            velocity: entry.velocity,
+            acceleration: entry.acceleration,
+            epoch: entry.epoch,
+            transmitter,
+        };
+        calibrator.validate();
+        calibrators.push(calibrator);
+    }
 
-    Ok(calibrator)
+    Ok(calibrators)
+}
+
+/// Writes samples to a raw interleaved little-endian 32-bit float IQ file.
+///
+/// # Arguments
+/// - `path`: Destination path where the samples will be written.
+/// - `samples`: The samples.
+///
+/// # Errors
+/// Returns a Python `IOError` if the file cannot be created or written
+fn write_cf32(path: &Path, samples: &[Complex32]) -> PyResult<()> {
+    let bytes = samples
+        .iter()
+        .flat_map(|s| [s.re.to_le_bytes(), s.im.to_le_bytes()])
+        .flatten()
+        .collect::<Vec<u8>>();
+    std::fs::write(path, bytes).map_err(|e| {
+        PyIOError::new_err(format!("Failed to write file '{}': {}", path.display(), e))
+    })
+}
+
+/// Reads samples from a raw interleaved little-endian 32-bit float IQ file.
+///
+/// # Arguments
+/// - `path`: Path to the file containing the samples.
+///
+/// # Returns
+/// The samples.
+///
+/// # Errors
+/// Returns a Python `IOError` if the file cannot be read or its size is not a multiple of 8 bytes.
+fn read_cf32(path: &Path) -> PyResult<Vec<Complex32>> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        PyIOError::new_err(format!("Failed to read file '{}': {}", path.display(), e))
+    })?;
+    if bytes.len() % 8 != 0 {
+        return Err(PyIOError::new_err(format!(
+            "File '{}' is not a cf32 file: its size is not a multiple of 8 bytes",
+            path.display()
+        )));
+    }
+    Ok(bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| {
+            Complex32::new(
+                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        })
+        .collect())
 }
 
 pub(crate) fn normalize_and_truncate(
@@ -553,4 +685,59 @@ pub(crate) fn normalize_and_truncate(
         .take(sample_window_size)
         .map(|s| s.unscale(norm))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrators_round_trip() {
+        let directory = std::env::temp_dir().join(format!("fringe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("calibrators.json");
+
+        let shared = Transmitter::new(
+            75e6,
+            20e6,
+            2.5,
+            vec![Complex32::new(1.0, -0.5), Complex32::new(-0.25, 0.75)],
+            Some(15e6),
+            0.5,
+        );
+        let calibrators = vec![
+            Calibrator::new(
+                Vec3::new(1.0, 2.0, 3.0),
+                shared.clone(),
+                Some(Vec3::new(4.0, 5.0, 6.0)),
+                Some(Vec3::new(7.0, 8.0, 9.0)),
+                10.0,
+            ),
+            Calibrator::new(Vec3::new(-1.0, 0.0, 1e5), shared, None, None, 0.0),
+        ];
+        save_calibrators(calibrators.clone(), path.to_str().unwrap()).unwrap();
+        let loaded = load_calibrators(path.to_str().unwrap()).unwrap();
+
+        // calibrators sharing a buffer share a buffer file
+        assert!(directory.join("calibrators.0.cf32").exists());
+        assert!(!directory.join("calibrators.1.cf32").exists());
+        assert!(Arc::ptr_eq(
+            &loaded[0].transmitter.buffer,
+            &loaded[1].transmitter.buffer
+        ));
+        for (a, b) in calibrators.iter().zip(&loaded) {
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.velocity, b.velocity);
+            assert_eq!(a.acceleration, b.acceleration);
+            assert_eq!(a.epoch, b.epoch);
+            assert_eq!(a.transmitter.frequency, b.transmitter.frequency);
+            assert_eq!(a.transmitter.sample_rate, b.transmitter.sample_rate);
+            assert_eq!(a.transmitter.power, b.transmitter.power);
+            assert_eq!(a.transmitter.bandwidth, b.transmitter.bandwidth);
+            assert_eq!(a.transmitter.start_time, b.transmitter.start_time);
+            assert_eq!(a.transmitter.buffer, b.transmitter.buffer);
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use clap::Parser;
-use fringe::{self, Simulation, load_array, load_calibrator, load_sources};
+use fringe::{self, Simulation, load_array, load_calibrators, load_sources};
 use hdf5::{File, Result};
 use num_complex::Complex32;
 
@@ -27,10 +27,10 @@ struct Input {
 
     /// Frequency resolution (must be >= 1)
     #[arg(
-        long, short, default_value_t = fringe::DEFAULT_FREQUENCY_RESOLUTION,
+        long, short, default_value_t = fringe::DEFAULT_FREQUENCY_RESOLUTION as u32,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
-    frequency_resolution: usize,
+    frequency_resolution: u32,
 
     /// The seed used for random number generation. When provided, the simulation will be reproducible. Otherwise a random seed will be used.
     #[arg(long, short = 'n')]
@@ -44,9 +44,13 @@ struct Input {
     #[arg(short, long, value_name = "FILE")]
     sources: String,
 
-    /// The calibrator model. File must be in JSON format.
+    /// The calibrators. File must be in JSON format, with transmit buffers in cf32 files next to it.
     #[arg(short, long, value_name = "FILE")]
-    calibrator: Option<String>,
+    calibrators: Option<String>,
+
+    /// Time (s) at which the simulated sample window starts.
+    #[arg(short, long, default_value_t = 0.0)]
+    time: f64,
 
     /// File to write output to. Must be in HDF5 format if it exists. Otherwise a new file will be created.
     #[arg(short, long, value_name = "FILE")]
@@ -62,24 +66,24 @@ fn main() {
 
     let array = load_array(&input.array).expect("Failed to load array");
     let sources = load_sources(&input.sources).expect("Failed to load sources");
-    let calibrator = input
-        .calibrator
+    let calibrators = input
+        .calibrators
         .as_ref()
-        .map(|path| load_calibrator(path).expect("Failed to load calibrator"));
+        .map(|path| load_calibrators(path).expect("Failed to load calibrators"));
 
     let mut simulation = Simulation::new(
         input.runtime,
         array,
-        input.frequency_resolution,
+        input.frequency_resolution as usize,
         input.rng_seed,
     );
 
     simulation.set_sources(sources);
-    if let Some(calibrator) = calibrator {
-        simulation.set_calibrator(calibrator);
+    if let Some(calibrators) = calibrators {
+        simulation.set_calibrators(calibrators);
     }
 
-    simulation.start();
+    simulation.start(Some(input.time));
     let result = simulation.finish();
 
     let outpath = Path::new(&input.output_file);
@@ -99,5 +103,5 @@ fn main() {
         .create(input.output_dataset.as_str())
         .expect("Failed to create output dataset");
 
-    dataset.write(&flat).expect("Failed to write output");
+    dataset.write_raw(&flat).expect("Failed to write output");
 }

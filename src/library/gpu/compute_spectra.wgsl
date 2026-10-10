@@ -5,11 +5,7 @@ struct Receiver {
     x: f32,
     y: f32,
     z: f32,
-    cal_dst: f32,
-    cal_time_delay: f32,
-    cal_dir_z: f32,
-    _p0: u32,
-    _p1: u32,
+    _p: u32,
 };
 
 struct Source {
@@ -27,7 +23,6 @@ struct Params {
     bandpass_fmax_mhz: f32,
     receiver_noise_i: f32,
     num_bins: u32,
-    cal_i0: f32,
     sources_tile_size: u32,
     source_offset: u32,
 };
@@ -75,25 +70,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     if (params.source_offset == 0) {
         let noise_phase = sum.x;
-        let cal_phase = sum.y;
-        spectrum[idx] = vec2<f32>(0.0, 0.0);
 
         // system noise contribution
         let lambda = LIGHT_SPEED / phys_freq;
         let eff_aperture = min(4.0, lambda*lambda/4.0);
         let noise_ampl = sqrt(params.receiver_noise_i / eff_aperture);
         sum = vec2<f32>(cos(noise_phase), sin(noise_phase)) * noise_ampl;
-
-        // calibrator signal contribution
-        let gain = rx.cal_dir_z * rx.cal_dir_z;
-        let cal_ampl = sqrt(gain * params.cal_i0) / rx.cal_dst / sqrt(2.0 * TAU);
-        let delta_phase = TAU * bin_freq * rx.cal_time_delay;
-        let new_cal_phase = cal_phase + delta_phase;
-        let cal_contrib = vec2<f32>(cos(new_cal_phase), sin(new_cal_phase)) * cal_ampl;
-
-        let u = sum + cal_contrib;
-        c = (u - sum) - cal_contrib;
-        sum = u;
+        c = vec2<f32>(0.0, 0.0);
     }
 
     for (var s = 0u; s < params.sources_tile_size; s++) {

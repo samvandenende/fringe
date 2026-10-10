@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 class Simulation:
     """Simulation for antenna signal generation."""
 
@@ -31,23 +33,38 @@ class Simulation:
         - `sources`: List of `Source` objects defining the sky model.
         """
         ...
-    def set_calibrator(self, calibrator: Calibrator) -> None:
+    def set_calibrators(self, calibrators: list[Calibrator]) -> None:
         """
-        Set or update the calibrator source.
+        Set or update the calibrators used in the simulation.
 
-        This calibrator will be used on the next call to `Simulation::start`
+        These calibrators will be used on the next call to `Simulation::start`.
+        Transmit buffers that did not change since the previous call are reused
+        without being processed again.
 
         # Arguments
-        - `calibrator`: `Calibrator` object with position and intensity.
+        - `calibrators`: List of `Calibrator` objects.
         """
         ...
-    def start(self) -> None:
+    def time(self) -> float:
+        """
+        Returns the time (s) at which the next sample window starts if
+        `Simulation::start` is called without a time.
+        """
+        ...
+    def start(self, time: float | None = None) -> None:
         """
         Start simulation of a batch of time-domain signals.
 
         The simulation work is dispatched to the configured runtime.
         `Simulation::finish` must be called to obtain the results before
         a next call to `Simulation::start`.
+
+        # Arguments
+        - `time`: Time (s) at which the first sample of the window is received.
+          If not given, the window directly follows the previous one.
+
+        # Panics
+        Panics if time is not finite.
         """
         ...
     def finish(self) -> list[list[complex]]:
@@ -60,11 +77,6 @@ class Simulation:
         A 2D vector of complex-valued antenna samples:
         - Outer dimension: antennas in the array
         - Inner dimension: time-domain samples
-        """
-        ...
-    def calibrator_frequency_domain_signal(self) -> list[complex]:
-        """
-        todo
         """
         ...
 
@@ -324,34 +336,212 @@ class Source:
         """
         ...
 
+class Transmitter:
+    """
+    Transmitter of a calibrator, configured like a software defined radio.
+
+    The transmitter plays its complex baseband buffer cyclically at `sample_rate`,
+    upconverted to the carrier `frequency`. Buffer samples are relative levels, like
+    the full scale of a DAC: `power` is the radiated power for a buffer with unit RMS.
+    """
+
+    def __init__(
+        self,
+        frequency: float,
+        sample_rate: float,
+        power: float,
+        buffer: Sequence[complex],
+        bandwidth: float | None = None,
+        start_time: float = 0.0,
+    ) -> None:
+        """
+        Creates a new transmitter.
+
+        # Arguments
+        - `frequency`: Carrier frequency (Hz).
+        - `sample_rate`: Rate at which buffer samples are played out (Hz).
+        - `power`: Equivalent isotropically radiated power (W) for a buffer with unit RMS.
+        - `buffer`: Complex baseband samples, transmitted cyclically.
+        - `bandwidth`: Optional bandwidth of the reconstruction filter (Hz).
+        - `start_time`: Time (s) at which the first buffer sample is transmitted.
+
+        # Panics
+        Panics if:
+        - frequency is negative
+        - sample_rate is not positive
+        - power is negative
+        - bandwidth is not positive
+        - buffer is empty or contains non-finite samples
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+    def frequency(self) -> float:
+        """Returns the carrier frequency in Hz."""
+        ...
+
+    def sample_rate(self) -> float:
+        """Returns the rate in Hz at which buffer samples are played out."""
+        ...
+
+    def power(self) -> float:
+        """Returns the radiated power in W for a buffer with unit RMS."""
+        ...
+
+    def bandwidth(self) -> float | None:
+        """Returns the bandwidth of the reconstruction filter in Hz, if any."""
+        ...
+
+    def buffer(self) -> list[complex]:
+        """Returns the transmitted buffer."""
+        ...
+
+    def start_time(self) -> float:
+        """Returns the time in s at which the first buffer sample is transmitted."""
+        ...
+
+    def set_frequency(self, frequency: float) -> None:
+        """
+        Sets the carrier frequency in Hz.
+
+        # Panics
+        Panics if frequency is negative.
+        """
+        ...
+
+    def set_sample_rate(self, sample_rate: float) -> None:
+        """
+        Sets the rate in Hz at which buffer samples are played out.
+
+        # Panics
+        Panics if sample_rate is not positive.
+        """
+        ...
+
+    def set_power(self, power: float) -> None:
+        """
+        Sets the radiated power in W for a buffer with unit RMS.
+
+        # Panics
+        Panics if power is negative.
+        """
+        ...
+
+    def set_bandwidth(self, bandwidth: float | None = None) -> None:
+        """
+        Sets the bandwidth of the reconstruction filter in Hz, or removes the filter with `None`.
+
+        # Panics
+        Panics if bandwidth is not positive.
+        """
+        ...
+
+    def set_buffer(self, buffer: Sequence[complex]) -> None:
+        """
+        Sets the buffer that is transmitted cyclically.
+
+        # Panics
+        Panics if buffer is empty or contains non-finite samples.
+        """
+        ...
+
+    def set_start_time(self, start_time: float) -> None:
+        """
+        Sets the time in s at which the first buffer sample is transmitted.
+
+        # Panics
+        Panics if start_time is not finite.
+        """
+        ...
+
 class Calibrator:
     """
     Calibrator used to model a known reference emitter (e.g. a satellite).
 
-    The calibrator acts as a deterministic signal source which can
-    be used for system calibration.
+    The calibrator transmits a deterministic signal from a position that moves
+    with constant acceleration:
+    `p(t) = position + velocity * (t - epoch) + acceleration * (t - epoch)^2 / 2`.
     """
 
-    def __init__(self, position: Vec3, intensity: float) -> None:
+    def __init__(
+        self,
+        position: Vec3,
+        transmitter: Transmitter,
+        velocity: Vec3 | None = None,
+        acceleration: Vec3 | None = None,
+        epoch: float = 0.0,
+    ) -> None:
         """
         Creates a new calibrator.
 
         # Arguments
-        - `position`: Position of the calibration source.
-        - `intensity`: Signal intensity of the calibrator.
+        - `position`: Position (m) of the calibrator at `epoch`.
+        - `transmitter`: Transmitter of the calibrator.
+        - `velocity`: Velocity (m/s) at `epoch`, zero if not given.
+        - `acceleration`: Constant acceleration (m/s²), zero if not given.
+        - `epoch`: Time (s) at which `position` and `velocity` are valid.
 
         # Panics
-        Panics if intensity is negative.
+        Panics if any of the kinematic parameters is not finite.
         """
         ...
 
     def __repr__(self) -> str: ...
     def position(self) -> Vec3:
-        """Returns the calibrator position."""
+        """Returns the calibrator position at `epoch`."""
         ...
 
-    def intensity(self) -> float:
-        """Returns the calibrator intensity."""
+    def velocity(self) -> Vec3:
+        """Returns the calibrator velocity at `epoch`."""
+        ...
+
+    def acceleration(self) -> Vec3:
+        """Returns the calibrator acceleration."""
+        ...
+
+    def epoch(self) -> float:
+        """Returns the time at which `position` and `velocity` are valid."""
+        ...
+
+    def transmitter(self) -> Transmitter:
+        """Returns the calibrator's transmitter."""
+        ...
+
+    def set_state(
+        self,
+        position: Vec3,
+        velocity: Vec3 | None = None,
+        acceleration: Vec3 | None = None,
+        epoch: float = 0.0,
+    ) -> None:
+        """
+        Replaces the kinematic state of the calibrator.
+
+        # Arguments
+        - `position`: Position (m) at `epoch`.
+        - `velocity`: Velocity (m/s) at `epoch`, zero if not given.
+        - `acceleration`: Constant acceleration (m/s²), zero if not given.
+        - `epoch`: Time (s) at which `position` and `velocity` are valid.
+
+        # Panics
+        Panics if any of the kinematic parameters is not finite.
+        """
+        ...
+
+    def set_transmitter(self, transmitter: Transmitter) -> None:
+        """Replaces the calibrator's transmitter."""
+        ...
+
+    def position_at(self, time: float) -> Vec3:
+        """
+        Computes the calibrator position at a given time.
+
+        # Arguments
+        - `time`: Time (s).
+
+        # Returns
+        The position (m) at `time`.
+        """
         ...
 
 def save_array(array: Array, filepath: str) -> None:
@@ -423,32 +613,38 @@ def load_sources(filepath: str) -> list[Source]:
     """
     ...
 
-def save_calibrator(calibrator: Calibrator, filepath: str) -> None:
+def save_calibrators(calibrators: list[Calibrator], filepath: str) -> None:
     """
-    Saves the calibrator to a file in JSON format.
+    Saves a list of calibrators to a file in JSON format.
+
+    The transmit buffers are written next to it as raw interleaved little-endian
+    32-bit float IQ files (`cf32_le`), named `<file stem>.<index>.cf32`.
+    Calibrators sharing a buffer share a buffer file.
 
     Args:
-        calibrator: The calibrator to serialize.
-        filepath: Destination path where the calibrator will be written.
+        calibrators: The list of calibrators.
+        filepath: Destination path where the calibrators will be written.
 
     Raises:
-        OSError: If the file cannot be created or written.
+        OSError: If a file cannot be created or written.
     """
     ...
 
-def load_calibrator(filepath: str) -> Calibrator:
+def load_calibrators(filepath: str) -> list[Calibrator]:
     """
-    Loads a calibrator from a JSON file.
+    Loads a list of calibrators from a JSON file.
 
     Args:
-        filepath: Path to the file containing a serialized Calibrator.
+        filepath: Path to the file containing a serialized list of Calibrators.
 
     Returns:
-        A reconstructed Calibrator instance.
+        A list of Calibrator objects.
 
     Raises:
-        OSError: If the file cannot be read or parsed.
+        OSError: If a file cannot be read or parsed.
 
-    Panics if:
-    - intensity is negative
+    Panics if, for a Calibrator:
+    - a kinematic parameter is not finite
+    - a transmitter parameter is invalid
     """
+    ...

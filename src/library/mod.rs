@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use calibrator::{CalibratorWindow, ConditionedBuffer};
 pub use model::*;
 use num_complex::Complex32;
 use pyo3::prelude::*;
@@ -5,6 +8,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 pub use utils::*;
 
+mod calibrator;
 mod cpu;
 mod gpu;
 mod model;
@@ -19,9 +23,11 @@ pub struct Simulation {
     runtime: Runtime,
     array: Array,
     sources: Vec<Source>,
-    calibrator: Option<Calibrator>,
+    calibrators: Vec<Calibrator>,
+    conditioned_buffers: Vec<Arc<ConditionedBuffer>>,
     random_phases: Option<Phases>,
     frequency_resolution: usize,
+    time: f64,
 }
 
 #[pymethods]
@@ -63,9 +69,11 @@ impl Simulation {
             runtime,
             array,
             sources: Vec::new(),
-            calibrator: None,
+            calibrators: Vec::new(),
+            conditioned_buffers: Vec::new(),
             random_phases: None,
             frequency_resolution,
+            time: 0.0,
         }
     }
 
@@ -79,19 +87,34 @@ impl Simulation {
         self.sources = sources;
     }
 
-    /// Set or update the calibrator source.
+    /// Set or update the calibrators used in the simulation.
     ///
-    /// This calibrator will be used on the next call to `Simulation::start`
+    /// These calibrators will be used on the next call to `Simulation::start`.
+    /// Transmit buffers that did not change since the previous call are reused
+    /// without being processed again.
     ///
     /// # Arguments
-    /// - `calibrator`: `Calibrator` object with position and intensity.
-    pub fn set_calibrator(&mut self, calibrator: Calibrator) {
-        self.calibrator = Some(calibrator);
+    /// - `calibrators`: List of `Calibrator` objects.
+    pub fn set_calibrators(&mut self, calibrators: Vec<Calibrator>) {
+        self.conditioned_buffers = calibrators
+            .iter()
+            .map(|calibrator| {
+                self.conditioned_buffers
+                    .iter()
+                    .find(|buffer| buffer.matches(&calibrator.transmitter))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(ConditionedBuffer::new(&self.array, &calibrator.transmitter))
+                    })
+            })
+            .collect();
+        self.calibrators = calibrators;
     }
 
-    /// Invalidates and regenerates the calibrator signal phase model on next run.
-    pub fn regenerate_calibrator_signal(&mut self) {
-        self.random_phases = None;
+    /// Returns the time (s) at which the next sample window starts if
+    /// `Simulation::start` is called without a time.
+    pub fn time(&self) -> f64 {
+        self.time
     }
 
     /// Start simulation of a batch of time-domain signals.
@@ -99,7 +122,29 @@ impl Simulation {
     /// The simulation work is dispatched to the configured runtime.
     /// `Simulation::finish` must be called to obtain the results before
     /// a next call to `Simulation::start`.
-    pub fn start(&mut self) {
+    ///
+    /// # Arguments
+    /// - `time`: Time (s) at which the first sample of the window is received.
+    ///   If not given, the window directly follows the previous one.
+    ///
+    /// # Panics
+    /// Panics if time is not finite.
+    #[pyo3(signature = (time = None))]
+    pub fn start(&mut self, time: Option<f64>) {
+        let start_time = time.unwrap_or(self.time);
+        assert!(start_time.is_finite(), "time must be finite");
+        self.time = start_time + self.array.sample_window_size as f64 / self.array.sample_frequency;
+
+        let calibrators = (!self.calibrators.is_empty()).then(|| {
+            Arc::new(CalibratorWindow::new(
+                &self.array,
+                &self.calibrators,
+                &self.conditioned_buffers,
+                self.array.sample_window_size * self.frequency_resolution,
+                start_time,
+            ))
+        });
+
         if let Some(phases) = &mut self.random_phases {
             phases.update(
                 &mut self.rng,
@@ -119,7 +164,7 @@ impl Simulation {
         self.runtime.start(
             &self.array,
             &self.sources,
-            self.calibrator.as_ref(),
+            calibrators.as_ref(),
             self.random_phases.as_ref().unwrap(),
         )
     }
@@ -134,10 +179,6 @@ impl Simulation {
     /// - Inner dimension: time-domain samples
     pub fn finish(&mut self) -> Vec<Vec<Complex32>> {
         self.runtime.finish()
-    }
-
-    pub fn calibrator_frequency_domain_signal(&self) -> Vec<Complex32> {
-        todo!()
     }
 }
 
@@ -172,19 +213,18 @@ impl Runtime {
     /// # Arguments
     /// - `array`: Antenna array configuration (positions, sampling parameters, etc.).
     /// - `sources`: List of signal sources contributing to the simulation.
-    /// - `calibrator`: Optional external calibrator.
-    /// - `phases`: Precomputed phase information for system noise, sources,
-    ///   and calibration signals.
+    /// - `calibrators`: Precomputed calibrator signals, if there are any calibrators.
+    /// - `phases`: Precomputed phase information for system noise and sources.
     fn start(
         &mut self,
         array: &Array,
         sources: &[Source],
-        calibrator: Option<&Calibrator>,
+        calibrators: Option<&Arc<CalibratorWindow>>,
         phases: &Phases,
     ) {
         match self {
-            Runtime::Cpu(runtime) => runtime.start(array, sources, calibrator, phases),
-            Runtime::Gpu(runtime) => runtime.start(array, sources, calibrator, phases),
+            Runtime::Cpu(runtime) => runtime.start(array, sources, calibrators, phases),
+            Runtime::Gpu(runtime) => runtime.start(array, sources, calibrators, phases),
         }
     }
 

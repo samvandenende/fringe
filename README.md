@@ -40,7 +40,7 @@ simulation pipeline, demonstrating agreement between the two approaches.
 - Designed specifically for FFTT imaging pipelines
 - Large-N array support
 - Large point-source sky models with power-law spectra
-- Optional calibrator source with known signal
+- Calibrators: SDR-style transmitters playing cyclic IQ buffers from moving positions, including Doppler
 - CPU runtime (multi-threaded)
 - Cross-platform GPU runtime (using `wgpu`)
 - Executable with command-line interface 
@@ -67,6 +67,34 @@ environment built on the Rust library. It can be used to
 - run simulations on the CPU or GPU runtime
 - inspect the time-domain antenna samples, spectra and waterfalls
 - form beamformed sky images and compare them against the analytic expectation
+
+---
+
+## Calibrators
+
+A calibrator is a known emitter, such as a satellite, used to calibrate the array. Each calibrator has a `Transmitter`, configured like a software defined radio:
+
+| Parameter | Meaning |
+|---|---|
+| `frequency` | Carrier frequency (Hz) |
+| `sample_rate` | Rate at which the buffer is played out (Hz) |
+| `power` | Radiated power (W) for a buffer with unit RMS; buffer samples are relative levels |
+| `buffer` | Complex baseband samples, transmitted cyclically |
+| `bandwidth` | Optional reconstruction filter bandwidth (Hz) |
+| `start_time` | Time (s) at which the first buffer sample is transmitted |
+
+The calibrator moves with constant acceleration from its `position` and `velocity` at `epoch`. The received signal is computed from the exact light-time delay to every antenna, so it includes carrier and code Doppler. Signals of consecutive sample windows are continuous in time.
+
+```python
+transmitter = fr.Transmitter(frequency=75e6, sample_rate=50e6, power=10.0, buffer=iq)
+calibrator = fr.Calibrator(position, transmitter, velocity=velocity, acceleration=acceleration)
+sim.set_calibrators([calibrator])
+sim.start(time=0.0)  # later calls to sim.start() continue where the previous window ended
+```
+
+Calibrators are saved with `save_calibrators` as a JSON list, with each transmit buffer in a raw interleaved little-endian 32-bit float IQ file (`cf32_le`) next to it.
+
+Calibrator signals are filtered by the array's bandpass like the sky. Near the band edges this filter is softened over about `sample_frequency / ((frequency_resolution - 1) * sample_window_size / 2)` Hz.
 
 ---
 
@@ -109,6 +137,7 @@ The `examples/` directory contains examples of how to use fringe.
 Current examples include:
 
 - A python script which loads an example array and sky model, simulates antenna data, and creates a sky image.
+- A python script which simulates a calibrator satellite in orbit, estimates its time of arrival at every antenna, and compares the accuracy to the Cramér-Rao bound.
 
 ## Tests
 
@@ -117,6 +146,8 @@ The `tests/` directory contains verification tests for the simulator.
 Current tests include:
 
 - Verification of CPU and GPU outputs being qualitatively identical. The outputs of both backends are compared sample-by-sample and are expected to agree upto floating-point rounding errors.
+
+Unit tests of the library, including verification of the calibrator signal model, run with `cargo test`.
 
 ---
 
