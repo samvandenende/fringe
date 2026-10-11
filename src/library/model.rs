@@ -10,6 +10,9 @@ use std::sync::Arc;
 /// - sampling configuration
 /// - frequency conversion parameters
 /// - simulation noise characteristics
+///
+/// The output samples are in √Jy: their mean power is the flux density (Jy) received
+/// per antenna, averaged over the sample frequency.
 #[pyclass(from_py_object)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Array {
@@ -32,7 +35,9 @@ impl Array {
     /// - `bandpass_fmin`: Lower cutoff frequency of the bandpass filter (Hz).
     /// - `bandpass_fmax`: Upper cutoff frequency of the bandpass filter (Hz).
     /// - `sample_window_size`: Number of samples per FFT window (must be power of two).
-    /// - `system_noise_intensity`: System noise intensity.
+    /// - `system_noise_intensity`: System noise power spectral density `k_B * T_sys` in
+    ///   Jy m² (1 Jy m² = 1e-26 W/Hz). It is received as a flux density of
+    ///   `system_noise_intensity / A_eff` Jy, with effective area `A_eff = min(λ² / 4, 4 m²)`.
     ///
     /// # Panics
     /// Panics if:
@@ -92,7 +97,7 @@ impl Array {
         self.sample_window_size
     }
 
-    /// Returns the system noise intensity.
+    /// Returns the system noise power spectral density in Jy m².
     pub fn system_noise_intensity(&self) -> f64 {
         self.system_noise_intensity
     }
@@ -104,7 +109,7 @@ impl Array {
     downmix_frequency = {:.2}MHz,
     bandpass = ({:.2} - {:.2})MHz,
     sample_window_size = {},
-    system_noise_intensity = {:.2},
+    system_noise_intensity = {:.2}Jy m²,
     antenna_positions = [...{} items...]
 )",
             self.sample_frequency / 1e6,
@@ -154,7 +159,7 @@ impl Array {
 /// Source in the simulated sky model.
 ///
 /// Each source emits a frequency-dependent signal characterized by a reference
-/// intensity and spectral index, and is located at a fixed direction vector.
+/// flux density (Jy) and spectral index, and is located at a fixed direction vector.
 #[pyclass(from_py_object)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Source {
@@ -170,8 +175,8 @@ impl Source {
     ///
     /// # Arguments
     /// - `direction`: Unit vector indicating source direction in space.
-    /// - `reference_frequency`: Frequency at which intensity is defined.
-    /// - `reference_intensity`: Signal strength at the reference frequency.
+    /// - `reference_frequency`: Frequency (Hz) at which the intensity is defined.
+    /// - `reference_intensity`: Flux density (Jy) at the reference frequency.
     /// - `spectral_index`: Power-law spectral index of the source.
     ///
     /// # Panics
@@ -205,7 +210,7 @@ impl Source {
         self.reference_frequency
     }
 
-    /// Returns the reference intensity at the reference frequency.
+    /// Returns the flux density in Jy at the reference frequency.
     pub fn reference_intensity(&self) -> f64 {
         self.reference_intensity
     }
@@ -215,7 +220,7 @@ impl Source {
         self.spectral_index
     }
 
-    /// Computes the intensity at a given frequency using a power-law model.
+    /// Computes the flux density in Jy at a given frequency (Hz) using a power-law model.
     ///
     /// # Panics
     /// Panics if `frequency <= 0.0`.
@@ -226,7 +231,7 @@ impl Source {
 
     fn __repr__(&self) -> String {
         format!(
-            "Source(direction={}, reference_frequency={:.2}MHz, reference_intensity={:.2}, spectral_index={:.3})",
+            "Source(direction={}, reference_frequency={:.2}MHz, reference_intensity={:.2}Jy, spectral_index={:.3})",
             self.direction.__repr__(),
             self.reference_frequency / 1e6,
             self.reference_intensity,
@@ -249,8 +254,15 @@ impl Source {
 /// Transmitter of a calibrator, configured like a software defined radio.
 ///
 /// The transmitter plays its complex baseband buffer cyclically at `sample_rate`,
-/// upconverted to the carrier `frequency`. Buffer samples are relative levels, like
-/// the full scale of a DAC: `power` is the radiated power for a buffer with unit RMS.
+/// upconverted to the carrier `frequency`. Buffer samples are relative levels: the buffer
+/// is scaled such that playing it cyclically radiates `power`, whatever its RMS. The
+/// reconstruction filter is applied after this scaling, so any part of the buffer's
+/// spectrum outside `bandwidth` reduces the radiated power.
+///
+/// A calibrator at distance `d` is received with a power flux density of `G * P / (4π d²)`
+/// (W/m²), with `G` the antenna gain. It is spread over the sample frequency `f_s` of the
+/// array, so a calibrator whose signal is white over `f_s` is received like a sky source
+/// of `G * P / (4π d² f_s)` W/m²/Hz, i.e. that divided by 1e-26 in Jy.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Transmitter {
@@ -269,7 +281,7 @@ impl Transmitter {
     /// # Arguments
     /// - `frequency`: Carrier frequency (Hz).
     /// - `sample_rate`: Rate at which buffer samples are played out (Hz).
-    /// - `power`: Equivalent isotropically radiated power (W) for a buffer with unit RMS.
+    /// - `power`: Equivalent isotropically radiated power (W) when playing the buffer.
     /// - `buffer`: Complex baseband samples, transmitted cyclically.
     /// - `bandwidth`: Optional bandwidth of the reconstruction filter (Hz).
     /// - `start_time`: Time (s) at which the first buffer sample is transmitted.
@@ -280,7 +292,7 @@ impl Transmitter {
     /// - sample_rate is not positive
     /// - power is negative
     /// - bandwidth is not positive
-    /// - buffer is empty or contains non-finite samples
+    /// - buffer is empty, all zero or contains non-finite samples
     #[new]
     #[pyo3(signature = (frequency, sample_rate, power, buffer, bandwidth = None, start_time = 0.0))]
     pub fn new(
@@ -313,7 +325,7 @@ impl Transmitter {
         self.sample_rate
     }
 
-    /// Returns the radiated power in W for a buffer with unit RMS.
+    /// Returns the equivalent isotropically radiated power in W.
     pub fn power(&self) -> f64 {
         self.power
     }
@@ -351,7 +363,7 @@ impl Transmitter {
         self.validate();
     }
 
-    /// Sets the radiated power in W for a buffer with unit RMS.
+    /// Sets the equivalent isotropically radiated power in W.
     ///
     /// # Panics
     /// Panics if power is negative.
@@ -373,7 +385,7 @@ impl Transmitter {
     /// Sets the buffer that is transmitted cyclically.
     ///
     /// # Panics
-    /// Panics if buffer is empty or contains non-finite samples.
+    /// Panics if buffer is empty, all zero or contains non-finite samples.
     pub fn set_buffer(&mut self, buffer: Vec<Complex32>) {
         self.buffer = buffer.into();
         self.validate();
@@ -424,6 +436,10 @@ impl Transmitter {
         assert!(
             self.buffer.iter().all(|s| s.is_finite()),
             "buffer must only contain finite samples"
+        );
+        assert!(
+            self.buffer.iter().any(|s| *s != Complex32::ZERO),
+            "buffer must not be all zero"
         );
         assert!(self.start_time.is_finite(), "start_time must be finite");
     }

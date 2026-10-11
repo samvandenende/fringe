@@ -7,6 +7,8 @@ use super::{Array, Calibrator, Transmitter, Vec3};
 
 /// Speed of light in vacuum (m/s).
 const C: f64 = 299792458.0;
+/// One jansky (W/m²/Hz), the unit of flux density of the sky model.
+const JANSKY: f64 = 1e-26;
 /// Oversampling factor of conditioned transmit buffers.
 const OVERSAMPLING: usize = 16;
 /// Relative Doppler shift the transmit buffer prefilter leaves room for (|v| up to 30 km/s).
@@ -19,9 +21,11 @@ const LIGHT_TIME_ITERATIONS: usize = 4;
 
 /// Transmit buffer prepared for interpolation.
 ///
-/// The buffer is filtered to the part of the spectrum that can reach the array's bandpass
-/// (widened by a guard band for Doppler) and to the transmitter's bandwidth, then
-/// oversampled by `OVERSAMPLING`. Because the buffer is cyclic, both steps are exact.
+/// The buffer is scaled to unit mean power, so that the transmitter radiates its `power`
+/// when playing it cyclically. It is then filtered to the part of the spectrum that can
+/// reach the array's bandpass (widened by a guard band for Doppler) and to the
+/// transmitter's bandwidth, and oversampled by `OVERSAMPLING`. Because the buffer is
+/// cyclic, both steps are exact.
 pub(crate) struct ConditionedBuffer {
     source: Arc<[Complex32]>,
     frequency: f64,
@@ -56,6 +60,7 @@ impl ConditionedBuffer {
             .iter()
             .map(|s| Complex64::new(s.re as f64, s.im as f64))
             .collect::<Vec<_>>();
+        let mean_power = spectrum.iter().map(|s| s.norm_sqr()).sum::<f64>() / len as f64;
         planner.plan_fft_forward(len).process(&mut spectrum);
 
         let guard = DOPPLER_GUARD * (array.downmix_frequency + array.bandpass[1]);
@@ -76,6 +81,8 @@ impl ConditionedBuffer {
         planner
             .plan_fft_inverse(oversampled_len)
             .process(&mut oversampled);
+        // undo the scaling of the forward FFT and scale to unit mean power
+        let scale = (len as f64 * mean_power.sqrt()).recip();
 
         ConditionedBuffer {
             source: transmitter.buffer.clone(),
@@ -84,7 +91,7 @@ impl ConditionedBuffer {
             bandwidth: transmitter.bandwidth,
             samples: oversampled
                 .iter()
-                .map(|s| Complex32::new((s.re / len as f64) as _, (s.im / len as f64) as _))
+                .map(|s| Complex32::new((s.re * scale) as _, (s.im * scale) as _))
                 .collect(),
         }
     }
@@ -345,7 +352,8 @@ impl CalibratorWindow {
                     assert!(distance > 0.0, "calibrator coincides with an antenna");
                     let direction_z = direction.z / distance;
                     let gain = direction_z * direction_z;
-                    let amplitude = (gain * transmitter.power / (2.0 * TAU)).sqrt() / distance;
+                    let amplitude =
+                        received_amplitude(gain, transmitter.power, distance, sample_frequency);
 
                     let (buffer_index, buffer_frac) = split(delay0 * signal.oversampled_rate, len);
                     let (_, carrier) = split(signal.frequency * delay0, 1.0);
@@ -423,6 +431,26 @@ impl CalibratorWindow {
         let phase = common.carrier - segment.carrier - signal.frequency * delay;
         value * Complex64::from_polar(segment.amplitude, TAU * phase)
     }
+}
+
+/// Computes the amplitude of a calibrator signal received by an antenna.
+///
+/// The received power flux density `G * P / (4π d²)` (W/m²) is expressed in the units of
+/// the sky model: spread over the sample frequency of the array and converted to Jy. A
+/// calibrator that is white over the sample frequency is therefore received like a sky
+/// source of the same flux density.
+///
+/// # Arguments
+/// - `gain`: Antenna gain in the direction of the calibrator.
+/// - `power`: Equivalent isotropically radiated power of the transmitter (W).
+/// - `distance`: Distance between the calibrator and the antenna (m).
+/// - `sample_frequency`: Sample frequency of the array (Hz).
+///
+/// # Returns
+/// The amplitude (√Jy) of a buffer with unit mean power.
+fn received_amplitude(gain: f64, power: f64, distance: f64, sample_frequency: f64) -> f64 {
+    let flux = gain * power / (2.0 * TAU * distance * distance);
+    (flux / (sample_frequency * JANSKY)).sqrt()
 }
 
 /// Computes the taper applied to calibrator signals.
@@ -795,7 +823,7 @@ mod tests {
                 let direction = calibrator.position_at(t - delay) - antenna;
                 let distance = direction.norm();
                 let gain = (direction.z / distance).powi(2);
-                let amplitude = (gain * power_w / (2.0 * TAU)).sqrt() / distance;
+                let amplitude = received_amplitude(gain, power_w, distance, SAMPLE_FREQUENCY);
                 let phase = (carrier - DOWNMIX_FREQUENCY) * t - carrier * delay;
                 value * Complex64::from_polar(amplitude, TAU * phase)
             })
@@ -845,11 +873,11 @@ mod tests {
         assert!(error < 1e-3);
     }
 
-    /// For a buffer that is white over the receiver sample rate, the received power equals
-    /// that of the previous calibrator implementation with intensity equal to `power`:
-    /// `G * P / (4π d²) * (in-band bins / bins)`.
+    /// A calibrator that is white over the receiver sample rate is received with the same
+    /// power as a sky source with the same flux density, `G * P / (4π d²)` spread over the
+    /// sample frequency, regardless of the scale of its buffer.
     #[test]
-    fn white_buffer_power() {
+    fn white_buffer_matches_source() {
         let sample_window_size = 4096;
         let mut rng = ChaCha8Rng::seed_from_u64(3);
         let mut buffer = (0..sample_window_size)
@@ -858,10 +886,10 @@ mod tests {
         FftPlanner::new()
             .plan_fft_inverse(sample_window_size)
             .process(&mut buffer);
-        let rms = power(&buffer).sqrt();
+        // the buffer has an RMS of 64, it is scaled to the transmitter power
         let buffer = buffer
             .iter()
-            .map(|s| Complex32::new((s.re / rms) as _, (s.im / rms) as _))
+            .map(|s| Complex32::new(s.re as _, s.im as _))
             .collect();
 
         let (power_w, distance) = (10.0, 1e3);
@@ -876,14 +904,11 @@ mod tests {
         let array = test_array(vec![Vec3::default()], sample_window_size);
         let calibrator = static_calibrator(Vec3::new(0.0, 0.0, distance), transmitter);
         // one bin per output sample, so the buffer is periodic over the synthesis window
-        let samples = &simulate(&array, vec![], vec![calibrator], 1, 0.0)[0];
+        let measured = power(&simulate(&array, vec![], vec![calibrator], 1, 0.0)[0]);
 
-        let bins = sample_window_size as f64;
-        let in_band_bins = (array.bandpass[1] * bins / SAMPLE_FREQUENCY).floor()
-            - (array.bandpass[0] * bins / SAMPLE_FREQUENCY).ceil()
-            + 1.0;
-        let expected = power_w / (2.0 * TAU * distance * distance) * in_band_bins / bins;
-        let measured = power(samples);
+        let flux_density = power_w / (2.0 * TAU * distance * distance) / SAMPLE_FREQUENCY / JANSKY;
+        let source = Source::new(Vec3::new(0.0, 0.0, 1.0), 75e6, flux_density, 0.0);
+        let expected = power(&simulate(&array, vec![source], vec![], 1, 0.0)[0]);
         println!("power ratio {}", measured / expected);
         assert!((measured / expected - 1.0).abs() < 1e-3);
     }
@@ -900,7 +925,7 @@ mod tests {
         let bin_spacing = SAMPLE_FREQUENCY / bins;
         let last_bin = (array.bandpass[1] / bin_spacing).floor();
         let position = Vec3::new(0.0, 0.0, 1e5);
-        let amplitude2 = 1.0 / (2.0 * TAU * position.norm2());
+        let amplitude2 = received_amplitude(1.0, 1.0, position.norm(), SAMPLE_FREQUENCY).powi(2);
 
         // received power relative to the transmitted tone
         let received_power = |bin: f64, velocity: f64| {

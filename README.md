@@ -70,6 +70,26 @@ environment built on the Rust library. It can be used to
 
 ---
 
+## Units
+
+All signals share one unit, so sky sources, receiver noise and calibrators can be combined consistently.
+
+| Parameter | Unit |
+|---|---|
+| `Source` `reference_intensity` | Flux density in Jy (1 Jy = 10⁻²⁶ W m⁻² Hz⁻¹) at `reference_frequency` |
+| `Array` `system_noise_intensity` | Noise power spectral density k<sub>B</sub>T<sub>sys</sub> in Jy m² (1 Jy m² = 10⁻²⁶ W/Hz) |
+| `Transmitter` `power` | Equivalent isotropically radiated power in W |
+
+The output samples are in √Jy: their mean power is the flux density received by an antenna, averaged over the sample frequency f<sub>s</sub>. The contributions are, with antenna gain G = cos²θ:
+
+- a source with flux density S, flat over the bandpass of width B, gives a mean power of G·S·B/f<sub>s</sub>
+- receiver noise is received as a flux density of `system_noise_intensity / A_eff`, with effective area A<sub>eff</sub> = min(λ²/4, 4 m²)
+- a calibrator at distance d gives a power flux density of G·P/(4πd²) W/m², spread over f<sub>s</sub>. A calibrator whose signal is white over f<sub>s</sub> is therefore received like a source of G·P/(4πd²f<sub>s</sub>)·10²⁶ Jy
+
+Antennas receive the full flux density; there is no polarization factor.
+
+---
+
 ## Calibrators
 
 A calibrator is a known emitter, such as a satellite, used to calibrate the array. Each calibrator has a `Transmitter`, configured like a software defined radio:
@@ -78,7 +98,7 @@ A calibrator is a known emitter, such as a satellite, used to calibrate the arra
 |---|---|
 | `frequency` | Carrier frequency (Hz) |
 | `sample_rate` | Rate at which the buffer is played out (Hz) |
-| `power` | Radiated power (W) for a buffer with unit RMS; buffer samples are relative levels |
+| `power` | Equivalent isotropically radiated power (W); buffer samples are relative levels, scaled such that playing the buffer cyclically radiates `power` |
 | `buffer` | Complex baseband samples, transmitted cyclically |
 | `bandwidth` | Optional reconstruction filter bandwidth (Hz) |
 | `start_time` | Time (s) at which the first buffer sample is transmitted |

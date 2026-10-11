@@ -26,9 +26,9 @@ POSITION = fr.Vec3(2e4, -1e4, 1e5)  # m
 VELOCITY = fr.Vec3(1600.0, 0.0, 0.0)  # m/s
 ACCELERATION = fr.Vec3(0.0, 0.0, -1.47)  # m/s², centripetal acceleration of the orbit
 
-# Noise intensity in the same units as the calibrator power, chosen for a
+# System noise k_B T_sys in Jy m² (T_sys of about 1.8e6 K), chosen for a
 # signal-to-noise ratio of about -4 dB per sample.
-SYSTEM_NOISE_INTENSITY = 3e-9
+SYSTEM_NOISE_INTENSITY = 2.5e9
 
 
 with open(ARRAY_FILE) as f:
