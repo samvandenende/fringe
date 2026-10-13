@@ -39,7 +39,7 @@ simulation pipeline, demonstrating agreement between the two approaches.
 - Generate complex time-domain samples for every antenna
 - Designed specifically for FFTT imaging pipelines
 - Large-N array support
-- Large point-source sky models with power-law spectra
+- Large point-source sky models with power-law spectra, optionally curved by 2nd and 3rd order spectral indices
 - Calibrators: SDR-style transmitters playing cyclic IQ buffers from moving positions, including Doppler
 - CPU runtime (multi-threaded)
 - Cross-platform GPU runtime (using `wgpu`)
@@ -77,6 +77,7 @@ All signals share one unit, so sky sources, receiver noise and calibrators can b
 | Parameter | Unit |
 |---|---|
 | `Source` `reference_intensity` | Flux density in Jy (1 Jy = 10⁻²⁶ W m⁻² Hz⁻¹) at `reference_frequency` |
+| `Source` `spectral_index`, `spectral_index_2`, `spectral_index_3` | Dimensionless, see below |
 | `Array` `system_noise_intensity` | Noise power spectral density k<sub>B</sub>T<sub>sys</sub> in Jy m² (1 Jy m² = 10⁻²⁶ W/Hz) |
 | `Transmitter` `power` | Equivalent isotropically radiated power in W |
 
@@ -87,6 +88,12 @@ The output samples are in √Jy: their mean power is the flux density received b
 - a calibrator at distance d gives a power flux density of G·P/(4πd²) W/m², spread over f<sub>s</sub>. A calibrator whose signal is white over f<sub>s</sub> is therefore received like a source of G·P/(4πd²f<sub>s</sub>)·10²⁶ Jy
 
 Antennas receive the full flux density; there is no polarization factor.
+
+A source's flux density at frequency f follows a log-polynomial spectrum (natural log), with S₀ = `reference_intensity`, f₀ = `reference_frequency` and α₁, α₂, α₃ = `spectral_index`, `spectral_index_2`, `spectral_index_3`:
+
+S(f) = S₀ · exp(α₁x + α₂x² + α₃x³), with x = ln(f/f₀)
+
+With α₂ = α₃ = 0 this is the power law S₀ (f/f₀)^α₁. In the sky model CSV the `spectral_index_2` and `spectral_index_3` columns are optional and default to 0.
 
 ---
 

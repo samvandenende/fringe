@@ -159,7 +159,12 @@ impl Array {
 /// Source in the simulated sky model.
 ///
 /// Each source emits a frequency-dependent signal characterized by a reference
-/// flux density (Jy) and spectral index, and is located at a fixed direction vector.
+/// flux density (Jy) and up to third-order spectral indices, and is located at a
+/// fixed direction vector. The flux density at frequency `f` is
+///
+/// `I(f) = I0 * exp(a1 * x + a2 * x^2 + a3 * x^3)`, with `x = ln(f / f0)`,
+///
+/// which is a power law with spectral index `a1` when `a2 = a3 = 0`.
 #[pyclass(from_py_object)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Source {
@@ -167,6 +172,10 @@ pub struct Source {
     pub(crate) reference_frequency: f64,
     pub(crate) reference_intensity: f64,
     pub(crate) spectral_index: f64,
+    #[serde(default)]
+    pub(crate) spectral_index_2: f64,
+    #[serde(default)]
+    pub(crate) spectral_index_3: f64,
 }
 
 #[pymethods]
@@ -177,24 +186,32 @@ impl Source {
     /// - `direction`: Unit vector indicating source direction in space.
     /// - `reference_frequency`: Frequency (Hz) at which the intensity is defined.
     /// - `reference_intensity`: Flux density (Jy) at the reference frequency.
-    /// - `spectral_index`: Power-law spectral index of the source.
+    /// - `spectral_index`: First-order (power-law) spectral index of the source.
+    /// - `spectral_index_2`: Second-order spectral index (curvature), defaults to 0.
+    /// - `spectral_index_3`: Third-order spectral index, defaults to 0.
     ///
     /// # Panics
     /// Panics if:
     /// - reference_frequency is not positive
     /// - reference_intensity is negative
+    /// - any spectral index is not finite
     #[new]
+    #[pyo3(signature = (direction, reference_frequency, reference_intensity, spectral_index, spectral_index_2 = 0.0, spectral_index_3 = 0.0))]
     pub fn new(
         direction: Vec3,
         reference_frequency: f64,
         reference_intensity: f64,
         spectral_index: f64,
+        spectral_index_2: f64,
+        spectral_index_3: f64,
     ) -> Self {
         let source = Source {
             direction: direction.normalized(),
             reference_frequency,
             reference_intensity,
             spectral_index,
+            spectral_index_2,
+            spectral_index_3,
         };
         source.validate();
         source
@@ -215,27 +232,40 @@ impl Source {
         self.reference_intensity
     }
 
-    /// Returns the spectral index used in the power-law intensity model.
+    /// Returns the first-order (power-law) spectral index.
     pub fn spectral_index(&self) -> f64 {
         self.spectral_index
     }
 
-    /// Computes the flux density in Jy at a given frequency (Hz) using a power-law model.
+    /// Returns the second-order spectral index (curvature).
+    pub fn spectral_index_2(&self) -> f64 {
+        self.spectral_index_2
+    }
+
+    /// Returns the third-order spectral index.
+    pub fn spectral_index_3(&self) -> f64 {
+        self.spectral_index_3
+    }
+
+    /// Computes the flux density in Jy at a given frequency (Hz) using the
+    /// log-polynomial spectral model.
     ///
     /// # Panics
     /// Panics if `frequency <= 0.0`.
     pub fn intensity(&self, frequency: f64) -> f64 {
         assert!(frequency > 0.0, "frequency must be positive");
-        self.reference_intensity * (frequency / self.reference_frequency).powf(self.spectral_index)
+        self.intensity_unchecked(frequency)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Source(direction={}, reference_frequency={:.2}MHz, reference_intensity={:.2}Jy, spectral_index={:.3})",
+            "Source(direction={}, reference_frequency={:.2}MHz, reference_intensity={:.2}Jy, spectral_index={:.3}, spectral_index_2={:.3}, spectral_index_3={:.3})",
             self.direction.__repr__(),
             self.reference_frequency / 1e6,
             self.reference_intensity,
-            self.spectral_index
+            self.spectral_index,
+            self.spectral_index_2,
+            self.spectral_index_3
         )
     }
 
@@ -248,6 +278,22 @@ impl Source {
             self.reference_intensity.is_finite() && self.reference_intensity >= 0.0,
             "reference_intensity must be non-negative"
         );
+        assert!(
+            self.spectral_index.is_finite()
+                && self.spectral_index_2.is_finite()
+                && self.spectral_index_3.is_finite(),
+            "spectral indices must be finite"
+        );
+    }
+}
+
+impl Source {
+    /// Flux density in Jy at a positive `frequency` (Hz), see [`Source::intensity`].
+    pub(crate) fn intensity_unchecked(&self, frequency: f64) -> f64 {
+        let x = (frequency / self.reference_frequency).ln();
+        self.reference_intensity
+            * (x * (self.spectral_index + x * (self.spectral_index_2 + x * self.spectral_index_3)))
+                .exp()
     }
 }
 
@@ -578,5 +624,47 @@ impl Calibrator {
         assert!(finite(self.acceleration), "acceleration must be finite");
         assert!(self.epoch.is_finite(), "epoch must be finite");
         self.transmitter.validate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(spectral_index_2: f64, spectral_index_3: f64) -> Source {
+        Source::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            75e6,
+            2.0,
+            -0.7,
+            spectral_index_2,
+            spectral_index_3,
+        )
+    }
+
+    #[test]
+    fn intensity_reduces_to_power_law() {
+        let source = source(0.0, 0.0);
+        for frequency in [10e6, 75e6, 150e6] {
+            let expected = 2.0 * (frequency / 75e6f64).powf(-0.7);
+            assert!((source.intensity(frequency) - expected).abs() <= 1e-12 * expected);
+        }
+    }
+
+    #[test]
+    fn intensity_includes_higher_orders() {
+        let source = source(-0.3, 0.1);
+        assert_eq!(source.intensity(75e6), 2.0);
+
+        let x = 2f64.ln();
+        let expected = 2.0 * (-0.7 * x - 0.3 * x * x + 0.1 * x * x * x).exp();
+        let intensity = source.intensity(150e6);
+        assert!((intensity - expected).abs() <= 1e-12 * expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "spectral indices must be finite")]
+    fn rejects_non_finite_spectral_index() {
+        source(f64::NAN, 0.0);
     }
 }

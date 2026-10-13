@@ -407,7 +407,7 @@ fn simulate_spectrum_calibrator_contributions(
 
 /// Adds the contributions from all astronomical sources to a synthesized spectrum.
 ///
-/// Each source is modeled using its reference intensity, spectral index and
+/// Each source is modeled using its reference intensity, spectral indices and
 /// geometric delay.
 ///
 /// # Arguments
@@ -453,9 +453,7 @@ fn simulate_spectrum_source_contributions(
         {
             let bin_frequency = fft_bin_frequency(spectrum_size, sample_frequency, index);
             let source_frequency = bin_frequency + downmix_frequency;
-            let amplitude = source_gain
-                * source.reference_intensity
-                * (source_frequency / source.reference_frequency).powf(source.spectral_index);
+            let amplitude = source_gain * source.intensity_unchecked(source_frequency);
             let phase = *phase as f64 + TAU * source_frequency * delay;
             *spectrum_value += Complex64::from_polar(amplitude.sqrt(), phase);
         }

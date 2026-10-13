@@ -12,8 +12,12 @@ struct Source {
     dir: vec4<f32>,
     f0: f32,
     i0: f32,
-    a: f32,
-    _pad: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct Params {
@@ -83,7 +87,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let src = sources[s];
 
         let gain = src.dir.z * src.dir.z; // cos^2(theta) gain model
-        let ampl = gain * src.i0 * pow(phys_freq / src.f0, src.a);
+        let x = log(phys_freq / src.f0);
+        let ampl = gain * src.i0 * exp(x * (src.a1 + x * (src.a2 + x * src.a3)));
 
         let phase = random_phase[s * params.num_bins + bin]
             + TAU * phys_freq * dot(src.dir, vec4<f32>(rx.x, rx.y, rx.z, 0.0)) / LIGHT_SPEED;

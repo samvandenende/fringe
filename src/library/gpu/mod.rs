@@ -110,7 +110,9 @@ struct SourceGpu {
     reference_frequency_MHz: f32,
     reference_intensity: f32,
     spectral_index: f32,
-    _p: u32,
+    spectral_index_2: f32,
+    spectral_index_3: f32,
+    _p: [u32; 3],
 }
 
 impl From<Source> for SourceGpu {
@@ -120,7 +122,9 @@ impl From<Source> for SourceGpu {
             reference_frequency_MHz: (value.reference_frequency / 1e6) as f32,
             reference_intensity: value.reference_intensity as _,
             spectral_index: value.spectral_index as _,
-            _p: 0,
+            spectral_index_2: value.spectral_index_2 as _,
+            spectral_index_3: value.spectral_index_3 as _,
+            _p: [0; 3],
         }
     }
 }
@@ -1203,7 +1207,7 @@ mod tests {
         (0..num_sources)
             .map(|i| {
                 let direction = Vec3::from_ra_dec(i as f64 * 0.1, 0.5 + i as f64 * 0.01);
-                Source::new(direction, 75e6, 1.0 + i as f64 * 0.01, -0.7)
+                Source::new(direction, 75e6, 1.0 + i as f64 * 0.01, -0.7, -0.3, 0.1)
             })
             .collect()
     }

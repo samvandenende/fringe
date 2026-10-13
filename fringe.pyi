@@ -289,7 +289,12 @@ class Source:
     Source in the simulated sky model.
 
     Each source emits a frequency-dependent signal characterized by a reference
-    flux density (Jy) and spectral index, and is located at a fixed direction vector.
+    flux density (Jy) and up to third-order spectral indices, and is located at a
+    fixed direction vector. The flux density at frequency `f` is
+
+    `I(f) = I0 * exp(a1 * x + a2 * x^2 + a3 * x^3)`, with `x = ln(f / f0)`,
+
+    which is a power law with spectral index `a1` when `a2 = a3 = 0`.
     """
 
     def __init__(
@@ -298,6 +303,8 @@ class Source:
         reference_frequency: float,
         reference_intensity: float,
         spectral_index: float,
+        spectral_index_2: float = 0.0,
+        spectral_index_3: float = 0.0,
     ) -> None:
         """
         Creates a new signal source.
@@ -306,12 +313,15 @@ class Source:
         - `direction`: Unit vector indicating source direction in space.
         - `reference_frequency`: Frequency (Hz) at which the intensity is defined.
         - `reference_intensity`: Flux density (Jy) at the reference frequency.
-        - `spectral_index`: Power-law spectral index of the source.
+        - `spectral_index`: First-order (power-law) spectral index of the source.
+        - `spectral_index_2`: Second-order spectral index (curvature), defaults to 0.
+        - `spectral_index_3`: Third-order spectral index, defaults to 0.
 
         # Panics
         Panics if:
         - reference_frequency is not positive
         - reference_intensity is negative
+        - any spectral index is not finite
         """
         ...
 
@@ -329,12 +339,21 @@ class Source:
         ...
 
     def spectral_index(self) -> float:
-        """Returns the spectral index used in the power-law intensity model."""
+        """Returns the first-order (power-law) spectral index."""
+        ...
+
+    def spectral_index_2(self) -> float:
+        """Returns the second-order spectral index (curvature)."""
+        ...
+
+    def spectral_index_3(self) -> float:
+        """Returns the third-order spectral index."""
         ...
 
     def intensity(self, frequency: float) -> float:
         """
-        Computes the flux density in Jy at a given frequency (Hz) using a power-law model.
+        Computes the flux density in Jy at a given frequency (Hz) using the
+        log-polynomial spectral model.
 
         # Panics
         Panics if `frequency <= 0.0`.
@@ -610,6 +629,8 @@ def load_sources(filepath: str) -> list[Source]:
     """
     Loads a list of sources from a CSV file.
 
+    The `spectral_index_2` and `spectral_index_3` columns are optional and default to 0.
+
     Args:
         filepath: Path to the file containing serialized Source entries.
 
@@ -622,6 +643,7 @@ def load_sources(filepath: str) -> list[Source]:
     Panics if:
     - reference_frequency is not positive
     - reference_intensity is negative
+    - any spectral index is not finite
     """
     ...
 

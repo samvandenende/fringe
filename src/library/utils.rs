@@ -377,6 +377,10 @@ struct SourceCsv {
     reference_frequency: f64,
     reference_intensity: f64,
     spectral_index: f64,
+    #[serde(default)]
+    spectral_index_2: f64,
+    #[serde(default)]
+    spectral_index_3: f64,
 }
 
 impl From<Source> for SourceCsv {
@@ -388,6 +392,8 @@ impl From<Source> for SourceCsv {
             reference_frequency: source.reference_frequency,
             reference_intensity: source.reference_intensity,
             spectral_index: source.spectral_index,
+            spectral_index_2: source.spectral_index_2,
+            spectral_index_3: source.spectral_index_3,
         }
     }
 }
@@ -400,6 +406,8 @@ impl From<SourceCsv> for Source {
             source.reference_frequency,
             source.reference_intensity,
             source.spectral_index,
+            source.spectral_index_2,
+            source.spectral_index_3,
         )
     }
 }
@@ -437,6 +445,8 @@ pub fn save_sources(sources: Vec<Source>, filepath: &str) -> PyResult<()> {
 
 /// Loads a list of sources from a CSV file.
 ///
+/// The `spectral_index_2` and `spectral_index_3` columns are optional and default to 0.
+///
 /// # Arguments
 /// - `filepath`: Path to the file containing a serialized list of `Source`s.
 ///
@@ -450,6 +460,7 @@ pub fn save_sources(sources: Vec<Source>, filepath: &str) -> PyResult<()> {
 /// Panics if, for a `Source`:
 /// - reference_frequency is not positive
 /// - reference_intensity is negative
+/// - any spectral index is not finite
 #[pyfunction]
 pub fn load_sources(filepath: &str) -> PyResult<Vec<Source>> {
     let file = std::fs::File::open(filepath)
@@ -690,6 +701,55 @@ pub(crate) fn normalize_and_truncate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sources_round_trip() {
+        let directory =
+            std::env::temp_dir().join(format!("fringe-test-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sources.csv");
+
+        let sources = vec![
+            Source::new(Vec3::from_ra_dec(1.0, 0.5), 75e6, 2.0, -0.7, -0.3, 0.1),
+            Source::new(Vec3::from_ra_dec(2.0, -0.2), 50e6, 0.5, 0.0, 0.0, 0.0),
+        ];
+        save_sources(sources.clone(), path.to_str().unwrap()).unwrap();
+        let loaded = load_sources(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(sources.len(), loaded.len());
+        for (a, b) in sources.iter().zip(&loaded) {
+            assert!((a.direction - b.direction).norm() < 1e-12);
+            assert_eq!(a.reference_frequency, b.reference_frequency);
+            assert_eq!(a.reference_intensity, b.reference_intensity);
+            assert_eq!(a.spectral_index, b.spectral_index);
+            assert_eq!(a.spectral_index_2, b.spectral_index_2);
+            assert_eq!(a.spectral_index_3, b.spectral_index_3);
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sources_without_higher_order_indices() {
+        let directory =
+            std::env::temp_dir().join(format!("fringe-test-sources-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sources.csv");
+        std::fs::write(
+            &path,
+            "right_ascension,declination,reference_frequency,reference_intensity,spectral_index\n\
+             1.0,0.5,75000000.0,2.0,-0.7\n",
+        )
+        .unwrap();
+
+        let loaded = load_sources(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].spectral_index, -0.7);
+        assert_eq!(loaded[0].spectral_index_2, 0.0);
+        assert_eq!(loaded[0].spectral_index_3, 0.0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn calibrators_round_trip() {

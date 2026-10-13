@@ -691,7 +691,7 @@ mod tests {
         let expected =
             wrap(TAU * (baseband_frequency + DOWNMIX_FREQUENCY) * direction.dot(baseline) / C);
 
-        let source = Source::new(direction, 75e6, 1.0, 0.0);
+        let source = Source::new(direction, 75e6, 1.0, 0.0, 0.0, 0.0);
         let samples = simulate(&array, vec![source], vec![], 4, 0.0);
         let spectra = samples
             .into_iter()
@@ -907,7 +907,7 @@ mod tests {
         let measured = power(&simulate(&array, vec![], vec![calibrator], 1, 0.0)[0]);
 
         let flux_density = power_w / (2.0 * TAU * distance * distance) / SAMPLE_FREQUENCY / JANSKY;
-        let source = Source::new(Vec3::new(0.0, 0.0, 1.0), 75e6, flux_density, 0.0);
+        let source = Source::new(Vec3::new(0.0, 0.0, 1.0), 75e6, flux_density, 0.0, 0.0, 0.0);
         let expected = power(&simulate(&array, vec![source], vec![], 1, 0.0)[0]);
         println!("power ratio {}", measured / expected);
         assert!((measured / expected - 1.0).abs() < 1e-3);
