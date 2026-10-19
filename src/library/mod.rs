@@ -3,6 +3,7 @@ use std::sync::Arc;
 use calibrator::{CalibratorWindow, ConditionedBuffer};
 pub use model::*;
 use num_complex::Complex32;
+use numpy::{PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -174,6 +175,28 @@ impl Simulation {
     /// Must be called after `Simulation::start`.
     ///
     /// # Returns
+    /// A 2D array of single precision complex-valued antenna samples, of shape
+    /// (antennas, samples).
+    #[pyo3(name = "finish")]
+    fn finish_array<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<Complex32>> {
+        let samples = self.finish();
+        let window_size = self.array.sample_window_size;
+        let array = PyArray2::zeros(py, [samples.len(), window_size], false);
+        // SAFETY: the array was just created, nothing else refers to it
+        let data = unsafe { array.as_slice_mut() }.expect("a new array is contiguous");
+        for (row, samples) in data.chunks_exact_mut(window_size.max(1)).zip(&samples) {
+            row.copy_from_slice(samples);
+        }
+        array
+    }
+}
+
+impl Simulation {
+    /// Collects simulation results from the runtime.
+    ///
+    /// Must be called after `Simulation::start`.
+    ///
+    /// # Returns
     /// A 2D vector of complex-valued antenna samples:
     /// - Outer dimension: antennas in the array
     /// - Inner dimension: time-domain samples
@@ -186,8 +209,8 @@ impl Simulation {
 ///
 /// The runtime is either a multithreaded CPU runtime or a GPU-accelerated runtime.
 enum Runtime {
-    Cpu(cpu::Runtime),
-    Gpu(gpu::Runtime),
+    Cpu(Box<cpu::Runtime>),
+    Gpu(Box<gpu::Runtime>),
 }
 
 impl Runtime {
@@ -202,8 +225,8 @@ impl Runtime {
     /// A newly initialized `Runtime`.
     fn new(runtime: &str, array: &Array, frequency_resolution: usize) -> Self {
         match runtime.trim().to_lowercase().as_str() {
-            "cpu" => Runtime::Cpu(cpu::Runtime::new(frequency_resolution)),
-            "gpu" => Runtime::Gpu(gpu::Runtime::new(array, frequency_resolution)),
+            "cpu" => Runtime::Cpu(Box::new(cpu::Runtime::new(frequency_resolution))),
+            "gpu" => Runtime::Gpu(Box::new(gpu::Runtime::new(array, frequency_resolution))),
             _ => panic!("Runtime must be one of [cpu, gpu]"),
         }
     }

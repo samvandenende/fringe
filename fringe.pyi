@@ -1,5 +1,8 @@
 from collections.abc import Sequence
 
+import numpy as np
+import numpy.typing as npt
+
 class Simulation:
     """Simulation for antenna signal generation."""
 
@@ -67,16 +70,16 @@ class Simulation:
         Panics if time is not finite.
         """
         ...
-    def finish(self) -> list[list[complex]]:
+    def finish(self) -> npt.NDArray[np.complex64]:
         """
         Collects simulation results from the runtime.
 
         Must be called after `Simulation::start`.
 
         # Returns
-        A 2D vector of complex-valued antenna samples:
-        - Outer dimension: antennas in the array
-        - Inner dimension: time-domain samples
+        A 2D array of single precision complex-valued antenna samples, of shape
+        (antennas, samples). Cast it to `np.complex128` if computations on it need double
+        precision.
         """
         ...
 

@@ -132,7 +132,7 @@ Fringe supports two execution backends:
 - CPU
 - GPU
 
-The CPU backend distributes work over multiple threads, parallelizing over the number of antennas in the array.
+The CPU backend distributes work over all available cores. The field of every source is computed once per sample window, and the antennas add it, delayed geometrically, in parallel.
 
 The GPU backend uses
 

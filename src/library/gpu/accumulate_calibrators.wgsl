@@ -1,7 +1,8 @@
 struct Params {
     sample_freq_mhz: f32,
-    bandpass_fmin_mhz: f32,
-    bandpass_fmax_mhz: f32,
+    // first bin and number of bins of the bandpass
+    band_start: u32,
+    band_len: u32,
     num_bins: u32,
     scale: f32,
     _p0: u32,
@@ -13,16 +14,6 @@ struct Params {
 @group(0) @binding(1) var<storage, read> signal_spectrum: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read_write> spectrum: array<vec2<f32>>;
 
-fn fft_bin_frequency(bin: u32) -> f32 {
-    let halfN: u32 = params.num_bins / 2u;
-
-    if (bin < halfN) {
-        return f32(bin) * params.sample_freq_mhz / f32(params.num_bins);
-    } else {
-        return f32(i32(bin) - i32(params.num_bins)) * params.sample_freq_mhz / f32(params.num_bins);
-    }
-}
-
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let bin = id.x;
@@ -32,9 +23,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // same bandpass as the sky in compute_spectra.wgsl
-    let bin_freq = fft_bin_frequency(bin);
-    if (bin_freq < params.bandpass_fmin_mhz || bin_freq > params.bandpass_fmax_mhz) {
+    // same bandpass as the sky in compute_noise.wgsl
+    if (bin < params.band_start || bin - params.band_start >= params.band_len) {
         return;
     }
 

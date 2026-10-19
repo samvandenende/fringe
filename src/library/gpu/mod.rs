@@ -3,22 +3,29 @@
 use super::{
     Array, Phases, Source, Vec3,
     calibrator::{CalibratorWindow, ConditionedBuffer, segment_half_len},
+    utils::bandpass_bins,
 };
 use num_complex::Complex32;
 use std::{num::NonZero, sync::Arc};
 
 const GPU_TILE_SIZE: u32 = 1024;
 const WORKGROUP_SIZE_X: u32 = 256;
-/// Upper bound on the GPU memory used by the large per-batch buffers
-/// (three spectrum buffers, two readback buffers and the phases tile).
+/// Upper bound on the GPU memory used by the large per-batch buffers (three spectrum
+/// buffers, two readback buffers, the noise phases, the phases tile and the fields tile).
 const GPU_MEMORY_BUDGET: u64 = 1 << 32;
 /// Number of large buffers that share `GPU_MEMORY_BUDGET`.
-const NUM_LARGE_BUFFERS: u64 = 6;
+const NUM_LARGE_BUFFERS: u64 = 8;
+/// Workgroup size of the pass that adds the sources, along the receivers.
+const SPECTRA_WORKGROUP_SIZE: u32 = 64;
+/// Number of consecutive bins evaluated by an invocation of the pass that adds the sources,
+/// `BLOCK` in compute_spectra.wgsl.
+const SPECTRA_BLOCK: u32 = 16;
 
 /// How the simulation is split up to fit within the device limits.
 ///
 /// Receivers are independent of each other, so they are processed in batches.
 /// Sources are accumulated in tiles, of which the random phases are uploaded one at a time.
+/// The buffers are sized for phases in every bin, although only the bandpass has them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BatchPlan {
     num_spectrum_bins: usize,
@@ -45,6 +52,7 @@ impl BatchPlan {
 
         let spectrum_size = (num_spectrum_bins * size_of::<Complex32>()) as u64;
         let phases_size = (num_spectrum_bins * size_of::<f32>()) as u64;
+        let fields_size = (num_spectrum_bins * size_of::<Complex32>()) as u64;
 
         assert!(
             num_spectrum_bins.div_ceil(WORKGROUP_SIZE_X as usize) <= max_workgroups,
@@ -58,7 +66,14 @@ impl BatchPlan {
         let receivers_per_batch = ((max_buffer_size / spectrum_size) as usize)
             .min(max_workgroups)
             .min(num_receivers);
-        let sources_per_tile = (max_buffer_size / phases_size).min(GPU_TILE_SIZE as u64) as u32;
+        let sources_per_tile = (max_buffer_size / phases_size)
+            .min(max_buffer_size / fields_size)
+            .min(GPU_TILE_SIZE as u64) as u32;
+        assert!(
+            num_receivers.div_ceil(SPECTRA_WORKGROUP_SIZE as usize) <= max_workgroups
+                && num_spectrum_bins.div_ceil(SPECTRA_BLOCK as usize) <= max_workgroups,
+            "the array is too large to dispatch on the GPU"
+        );
 
         BatchPlan {
             num_spectrum_bins,
@@ -73,6 +88,14 @@ impl BatchPlan {
 
     fn phases_tile_buffer_size(&self) -> u64 {
         (self.sources_per_tile as usize * self.num_spectrum_bins * size_of::<f32>()) as u64
+    }
+
+    fn fields_tile_buffer_size(&self) -> u64 {
+        (self.sources_per_tile as usize * self.num_spectrum_bins * size_of::<Complex32>()) as u64
+    }
+
+    fn noise_phases_buffer_size(&self) -> u64 {
+        (self.receivers_per_batch * self.num_spectrum_bins * size_of::<f32>()) as u64
     }
 }
 
@@ -134,31 +157,31 @@ impl From<Source> for SourceGpu {
 struct ComputeSpectraParams {
     array_sample_frequency_MHz: f32,
     array_downmix_frequency_MHz: f32,
-    array_bandpass_fmin_MHz: f32,
-    array_bandpass_fmax_MHz: f32,
-    array_system_noise_intensity: f32,
+    band_start: u32,
+    band_len: u32,
     spectrum_synthesis_window_size: u32,
     sources_tile_size: u32,
-    source_offset: u32,
+    num_receivers: u32,
+    array_system_noise_intensity: f32,
 }
 
 impl ComputeSpectraParams {
-    fn new(array: &Array, num_spectrum_bins: usize) -> Self {
+    fn new(array: &Array, phases: &Phases, num_spectrum_bins: usize) -> Self {
         ComputeSpectraParams {
             array_sample_frequency_MHz: (array.sample_frequency / 1e6) as f32,
             array_downmix_frequency_MHz: (array.downmix_frequency / 1e6) as f32,
-            array_bandpass_fmin_MHz: (array.bandpass[0] / 1e6) as f32,
-            array_bandpass_fmax_MHz: (array.bandpass[1] / 1e6) as f32,
-            array_system_noise_intensity: array.system_noise_intensity as _,
+            band_start: *phases.band.start() as _,
+            band_len: phases.band_len() as _,
             spectrum_synthesis_window_size: num_spectrum_bins as _,
             sources_tile_size: 0,
-            source_offset: 0,
+            num_receivers: 0,
+            array_system_noise_intensity: array.system_noise_intensity as _,
         }
     }
 
-    fn update(&mut self, sources_tile_size: u32, source_offset: u32) {
+    fn update(&mut self, sources_tile_size: u32, num_receivers: u32) {
         self.sources_tile_size = sources_tile_size;
-        self.source_offset = source_offset;
+        self.num_receivers = num_receivers;
     }
 }
 
@@ -226,8 +249,8 @@ struct ComputeCalibratorsParams {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AccumulateCalibratorsParams {
     array_sample_frequency_MHz: f32,
-    array_bandpass_fmin_MHz: f32,
-    array_bandpass_fmax_MHz: f32,
+    band_start: u32,
+    band_len: u32,
     num_bins: u32,
     scale: f32,
     _p: [u32; 3],
@@ -261,6 +284,7 @@ pub(crate) struct Runtime {
     receiver_buf: wgpu::Buffer,
     sources_tile_buf: wgpu::Buffer,
     phases_tile_buf: wgpu::Buffer,
+    noise_phases_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     spectra_buf1: wgpu::Buffer,
     spectra_buf2: wgpu::Buffer,
@@ -268,6 +292,10 @@ pub(crate) struct Runtime {
     // double buffered, so a batch can be read back while the next one is computed
     readback_bufs: [wgpu::Buffer; 2],
     calibrator_bufs: Option<CalibratorBuffers>,
+    compute_noise_bindgroup: wgpu::BindGroup,
+    compute_noise_pipeline: wgpu::ComputePipeline,
+    compute_fields_bindgroup: wgpu::BindGroup,
+    compute_fields_pipeline: wgpu::ComputePipeline,
     compute_spectra_bindgroup: wgpu::BindGroup,
     compute_spectra_pipeline: wgpu::ComputePipeline,
     compute_ifft_bgl: wgpu::BindGroupLayout,
@@ -341,6 +369,20 @@ impl Runtime {
             mapped_at_creation: false,
         });
 
+        let noise_phases_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Noise phases"),
+            size: plan.noise_phases_buffer_size(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let fields_tile_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fields tile"),
+            size: plan.fields_tile_buffer_size(),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let params_size = [
             size_of::<ComputeSpectraParams>(),
             size_of::<ComputeIfftParams>(),
@@ -379,37 +421,87 @@ impl Runtime {
             })
         });
 
-        let compute_spectra_bgl = bind_group_layout(
+        let compute_noise_bgl = bind_group_layout(
             &device,
             &[
-                // receivers
-                storage_entry(0),
+                // params
+                uniform_entry(0),
+                // noise phases
+                storage_entry(1),
+                // output spectrum
+                storage_rw_entry(2),
+            ],
+        );
+        let compute_noise_bindgroup = bind_group(
+            &device,
+            &compute_noise_bgl,
+            &[
+                params_binding::<ComputeSpectraParams>(&params_buf),
+                noise_phases_buf.as_entire_binding(),
+                spectra_buf1.as_entire_binding(),
+            ],
+        );
+        let compute_noise_pipeline = compute_pipeline(
+            &device,
+            &compute_noise_bgl,
+            wgpu::include_wgsl!("compute_noise.wgsl"),
+        );
+
+        let compute_fields_bgl = bind_group_layout(
+            &device,
+            &[
+                // params
+                uniform_entry(0),
                 // sources
                 storage_entry(1),
                 // random phase
                 storage_entry(2),
-                // params
-                uniform_entry(3),
-                // output spectrum
-                storage_rw_entry(4),
-                // kahan summation buffer
-                storage_rw_entry(5),
+                // fields
+                storage_rw_entry(3),
             ],
         );
+        let compute_fields_bindgroup = bind_group(
+            &device,
+            &compute_fields_bgl,
+            &[
+                params_binding::<ComputeSpectraParams>(&params_buf),
+                sources_tile_buf.as_entire_binding(),
+                phases_tile_buf.as_entire_binding(),
+                fields_tile_buf.as_entire_binding(),
+            ],
+        );
+        let compute_fields_pipeline = compute_pipeline(
+            &device,
+            &compute_fields_bgl,
+            wgpu::include_wgsl!("compute_fields.wgsl"),
+        );
 
+        let compute_spectra_bgl = bind_group_layout(
+            &device,
+            &[
+                // params
+                uniform_entry(0),
+                // receivers
+                storage_entry(1),
+                // sources
+                storage_entry(2),
+                // fields
+                storage_entry(3),
+                // output spectrum
+                storage_rw_entry(4),
+            ],
+        );
         let compute_spectra_bindgroup = bind_group(
             &device,
             &compute_spectra_bgl,
             &[
+                params_binding::<ComputeSpectraParams>(&params_buf),
                 receiver_buf.as_entire_binding(),
                 sources_tile_buf.as_entire_binding(),
-                phases_tile_buf.as_entire_binding(),
-                params_buf.as_entire_binding(),
+                fields_tile_buf.as_entire_binding(),
                 spectra_buf1.as_entire_binding(),
-                spectra_buf2.as_entire_binding(),
             ],
         );
-
         let compute_spectra_pipeline = compute_pipeline(
             &device,
             &compute_spectra_bgl,
@@ -495,12 +587,17 @@ impl Runtime {
             receiver_buf,
             sources_tile_buf,
             phases_tile_buf,
+            noise_phases_buf,
             params_buf,
             spectra_buf1,
             spectra_buf2,
             spectra_buf3,
             readback_bufs,
             calibrator_bufs: None,
+            compute_noise_bindgroup,
+            compute_noise_pipeline,
+            compute_fields_bindgroup,
+            compute_fields_pipeline,
             compute_spectra_bindgroup,
             compute_spectra_pipeline,
             compute_ifft_bgl,
@@ -525,9 +622,9 @@ impl Runtime {
     /// Receivers are processed in batches that fit within the device limits.
     /// For each batch, this method:
     /// - Uploads receiver geometry to the GPU
-    /// - Uploads system noise phases
-    /// - Processes sources in tiled batches
-    /// - Runs spectrum synthesis compute shader per tile
+    /// - Uploads the system noise phases and initializes the spectra with the system noise
+    /// - Processes sources in tiles: computes the field of every source of the tile, then
+    ///   adds the fields, delayed geometrically, to the spectrum of every receiver
     /// - Evaluates the calibrator signals, transforms them with a forward FFT
     ///   and adds them to the spectrum within the bandpass
     /// - Executes iterative inverse FFT stages (ping-pong buffering)
@@ -560,7 +657,7 @@ impl Runtime {
             self.read_back(stale);
         }
         self.samples = Vec::with_capacity(receivers.len());
-        let mut params = ComputeSpectraParams::new(array, num_spectrum_bins);
+        let mut params = ComputeSpectraParams::new(array, phases, num_spectrum_bins);
         let calibrators_bindgroup = calibrators.map(|window| self.upload_calibrators(window));
 
         for (batch_idx, receivers_batch) in
@@ -760,26 +857,33 @@ impl Runtime {
         self.queue
             .write_buffer(&self.receiver_buf, 0, bytemuck::cast_slice(receivers));
 
-        let bins_range = receiver_offset * num_spectrum_bins
-            ..(receiver_offset + receivers.len()) * num_spectrum_bins;
-        let system_noise_phases: Vec<Complex32> = phases.system_noise[bins_range]
-            .iter()
-            .map(|r| Complex32::new(*r, 0.0))
-            .collect();
+        let band_len = phases.band_len();
         self.queue.write_buffer(
-            &self.spectra_buf1,
+            &self.noise_phases_buf,
             0,
-            bytemuck::cast_slice(&system_noise_phases),
+            bytemuck::cast_slice(
+                &phases.system_noise
+                    [receiver_offset * band_len..(receiver_offset + receivers.len()) * band_len],
+            ),
+        );
+        params.update(0, receivers.len() as _);
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(params));
+        self.submit_pass(
+            &self.compute_noise_pipeline,
+            &self.compute_noise_bindgroup,
+            num_spectrum_bins,
+            receivers.len(),
+            None,
         );
 
-        let num_tiles = (sources.len() as u32).div_ceil(tile_size_max).max(1);
+        let num_tiles = (sources.len() as u32).div_ceil(tile_size_max);
         for tile in 0..num_tiles {
             let source_offset = tile * tile_size_max;
             let tile_size = (sources.len() as u32 - source_offset).min(tile_size_max);
-            let phase_offset = source_offset as usize * num_spectrum_bins;
+            let tile = source_offset as usize..(source_offset + tile_size) as usize;
             // upload source tile
-            let sources_slice = sources
-                [source_offset as usize..(source_offset + tile_size) as usize]
+            let sources_slice = sources[tile.clone()]
                 .iter()
                 .map(|source| source.clone().into())
                 .collect::<Vec<SourceGpu>>();
@@ -789,19 +893,31 @@ impl Runtime {
                 bytemuck::cast_slice(&sources_slice),
             );
             // upload source phase tile
-            let phase_len = tile_size as usize * num_spectrum_bins;
-            let phases_slice = &phases.sources[phase_offset..phase_offset + phase_len];
+            let phases_slice = &phases.sources[tile.start * band_len..tile.end * band_len];
             self.queue
                 .write_buffer(&self.phases_tile_buf, 0, bytemuck::cast_slice(phases_slice));
             // upload params
-            params.update(tile_size, source_offset);
+            params.update(tile_size, receivers.len() as _);
             self.queue
                 .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(params));
-            self.submit_pass(
-                &self.compute_spectra_pipeline,
-                &self.compute_spectra_bindgroup,
-                num_spectrum_bins,
-                receivers.len(),
+            // the fields of the sources, then their sum at every receiver
+            self.submit_dispatches(
+                &[
+                    (
+                        &self.compute_fields_pipeline,
+                        &self.compute_fields_bindgroup,
+                        [(band_len as u32).div_ceil(WORKGROUP_SIZE_X), tile_size, 1],
+                    ),
+                    (
+                        &self.compute_spectra_pipeline,
+                        &self.compute_spectra_bindgroup,
+                        [
+                            (receivers.len() as u32).div_ceil(SPECTRA_WORKGROUP_SIZE),
+                            (band_len as u32).div_ceil(SPECTRA_BLOCK),
+                            1,
+                        ],
+                    ),
+                ],
                 None,
             );
         }
@@ -868,6 +984,7 @@ impl Runtime {
         receiver_offset: usize,
     ) {
         let num_spectrum_bins = self.plan.num_spectrum_bins;
+        let band = bandpass_bins(array.bandpass, array.sample_frequency, num_spectrum_bins);
         let segments_per_receiver = window.calibrators.len() * window.num_segments;
         let segments = window.segments[receiver_offset * segments_per_receiver
             ..(receiver_offset + num_receivers) * segments_per_receiver]
@@ -911,8 +1028,8 @@ impl Runtime {
 
         let params = AccumulateCalibratorsParams {
             array_sample_frequency_MHz: (array.sample_frequency / 1e6) as f32,
-            array_bandpass_fmin_MHz: (array.bandpass[0] / 1e6) as f32,
-            array_bandpass_fmax_MHz: (array.bandpass[1] / 1e6) as f32,
+            band_start: *band.start() as _,
+            band_len: band.clone().count() as _,
             num_bins: num_spectrum_bins as _,
             // undo the scaling of the inverse FFT and the normalization of the output samples
             scale: (num_spectrum_bins as f32).sqrt().recip(),
@@ -1002,18 +1119,41 @@ impl Runtime {
         num_receivers: usize,
         copy: Option<(&wgpu::Buffer, &wgpu::Buffer, u64)>,
     ) -> wgpu::SubmissionIndex {
+        self.submit_dispatches(
+            &[(
+                pipeline,
+                bindgroup,
+                [
+                    (num_x as u32).div_ceil(WORKGROUP_SIZE_X),
+                    num_receivers as _,
+                    1,
+                ],
+            )],
+            copy,
+        )
+    }
+
+    /// Submits compute passes that run one after the other, optionally followed by a buffer copy.
+    ///
+    /// # Arguments
+    /// - `dispatches`: Pipeline, bind group and number of workgroups of every pass.
+    /// - `copy`: Optional copy `(source, destination, size)` after the passes.
+    ///
+    /// # Returns
+    /// The index of the submission.
+    fn submit_dispatches(
+        &self,
+        dispatches: &[(&wgpu::ComputePipeline, &wgpu::BindGroup, [u32; 3])],
+        copy: Option<(&wgpu::Buffer, &wgpu::Buffer, u64)>,
+    ) -> wgpu::SubmissionIndex {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
+        for &(pipeline, bindgroup, [x, y, z]) in dispatches {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bindgroup, &[]);
-            pass.dispatch_workgroups(
-                (num_x as u32).div_ceil(WORKGROUP_SIZE_X),
-                num_receivers as _,
-                1,
-            );
+            pass.dispatch_workgroups(x, y, z);
         }
         if let Some((source, destination, size)) = copy {
             encoder.copy_buffer_to_buffer(source, 0, destination, 0, size);
@@ -1338,7 +1478,7 @@ mod tests {
         assert!(plan.spectra_buffer_size() <= limits.max_storage_buffer_binding_size);
         assert!(plan.phases_tile_buffer_size() <= limits.max_storage_buffer_binding_size);
         assert_eq!(plan.receivers_per_batch, 256);
-        assert_eq!(plan.sources_per_tile, 512);
+        assert_eq!(plan.sources_per_tile, 256);
     }
 
     #[test]
@@ -1363,11 +1503,11 @@ mod tests {
         let mut unbatched = Runtime::new(&array, frequency_resolution);
         assert_eq!(unbatched.plan.receivers_per_batch, 37);
 
-        // room for 5 receivers per batch and 10 sources per tile
+        // room for 5 receivers per batch and 5 sources per tile
         let budget = NUM_LARGE_BUFFERS * num_spectrum_bins * 8 * 5;
         let mut batched = Runtime::with_memory_budget(&array, frequency_resolution, budget);
         assert_eq!(batched.plan.receivers_per_batch, 5);
-        assert_eq!(batched.plan.sources_per_tile, 10);
+        assert_eq!(batched.plan.sources_per_tile, 5);
 
         let expected = simulate(&mut unbatched, &array, &sources, frequency_resolution);
         let actual = simulate(&mut batched, &array, &sources, frequency_resolution);

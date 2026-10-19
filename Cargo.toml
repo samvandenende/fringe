@@ -15,6 +15,7 @@ path = "src/main.rs"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 num-complex = { version = "0.4.6", features = ["bytemuck"] }
+numpy = "0.29"
 pollster = "0.4.0"
 pyo3 = { version = "0.29", features = ["num-complex"] }
 wgpu = "29.0.3"

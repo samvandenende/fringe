@@ -4,8 +4,10 @@ use num_complex::Complex32;
 use pyo3::PyResult;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
+use rand::Rng;
+use rand_chacha::ChaCha8Rng;
 use std::f32::consts::TAU;
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div, Mul, RangeInclusive, Sub};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -230,8 +232,16 @@ impl Div<f64> for Vec3 {
 /// This structure stores random phase offsets for:
 /// - system noise per antenna
 /// - per-source spectral phases
+///
+/// Only the bins within the bandpass have phases. Every phase is drawn from the position in
+/// the random stream it would have if all bins had one, so the phases of a seed do not depend
+/// on the bandpass and are generated in parallel.
 pub(crate) struct Phases {
-    pub(crate) system_noise: Vec<f32>,
+    /// Bins of the synthesis window within the bandpass.
+    pub(crate) band: RangeInclusive<usize>,
+    /// Indexed by `antenna * band_len + bin - band.start()`.
+    pub(crate) system_noise: Arc<Vec<f32>>,
+    /// Indexed by `source * band_len + bin - band.start()`.
     pub(crate) sources: Arc<Vec<f32>>,
 }
 
@@ -247,13 +257,14 @@ impl Phases {
     /// # Returns
     /// Fully initialized phases
     pub(crate) fn new(
-        rng: &mut impl rand::Rng,
+        rng: &mut ChaCha8Rng,
         array: &Array,
         num_sources: usize,
         frequency_resolution: usize,
     ) -> Self {
         let mut phases = Phases {
-            system_noise: Vec::new(),
+            band: 0..=0,
+            system_noise: Arc::new(Vec::new()),
             sources: Arc::new(Vec::new()),
         };
 
@@ -262,11 +273,19 @@ impl Phases {
         phases
     }
 
+    /// Number of bins within the bandpass.
+    pub(crate) fn band_len(&self) -> usize {
+        self.band.clone().count()
+    }
+
     /// Updates all stochastic phase components with new random values.
     ///
     /// This regenerates:
     /// - system noise phases per antenna
     /// - per-source spectral phases
+    ///
+    /// The random stream advances as if every bin of the synthesis window had phases: first
+    /// those of the system noise of every antenna, then those of every source.
     ///
     /// # Arguments
     /// - `rng`: Random number generator
@@ -275,25 +294,100 @@ impl Phases {
     /// - `frequency_resolution`: FFT oversampling factor
     pub(crate) fn update(
         &mut self,
-        rng: &mut impl rand::Rng,
+        rng: &mut ChaCha8Rng,
         array: &Array,
         num_sources: usize,
         frequency_resolution: usize,
     ) {
         let num_spectrum_bins = array.sample_window_size * frequency_resolution;
+        self.band = bandpass_bins(array.bandpass, array.sample_frequency, num_spectrum_bins);
+        let band_len = self.band_len();
+        let first = *self.band.start();
+        let num_antennas = array.antenna_positions.len();
 
-        let num_system_noise_phases = array.antenna_positions.len() * num_spectrum_bins;
-        let num_source_phases = num_sources * num_spectrum_bins;
-
-        self.system_noise = (0..num_system_noise_phases)
-            .map(|_| rng.random_range(0.0..TAU))
-            .collect();
-        self.sources = Arc::new(
-            (0..num_source_phases)
-                .map(|_| rng.random_range(0.0..TAU))
-                .collect(),
+        let start = rng.get_word_pos();
+        fill_phases(
+            &mut self.system_noise,
+            rng,
+            num_antennas,
+            band_len,
+            |antenna| start + (antenna * num_spectrum_bins + first) as u128,
         );
+        let sources_start = start + (num_antennas * num_spectrum_bins) as u128;
+        fill_phases(&mut self.sources, rng, num_sources, band_len, |source| {
+            sources_start + (source * num_spectrum_bins + first) as u128
+        });
+        rng.set_word_pos(sources_start + (num_sources * num_spectrum_bins) as u128);
     }
+}
+
+/// Fills `phases` with `rows` rows of `row_len` random phases in parallel.
+///
+/// The allocation is reused if no runtime still holds the previous phases.
+///
+/// # Arguments
+/// - `phases`: Phases to fill.
+/// - `rng`: Random number generator, of which the position is not changed.
+/// - `rows`: Number of rows.
+/// - `row_len`: Number of phases per row.
+/// - `word_pos`: Position in the random stream of the first phase of a row.
+fn fill_phases(
+    phases: &mut Arc<Vec<f32>>,
+    rng: &ChaCha8Rng,
+    rows: usize,
+    row_len: usize,
+    word_pos: impl Fn(usize) -> u128 + Sync,
+) {
+    let len = rows * row_len;
+    let phases = match Arc::get_mut(phases) {
+        Some(phases) => phases,
+        None => {
+            *phases = Arc::new(Vec::new());
+            Arc::get_mut(phases).unwrap()
+        }
+    };
+    phases.resize(len, 0.0);
+    if len == 0 {
+        return;
+    }
+
+    let fill = |first_row: usize, chunk: &mut [f32]| {
+        let mut rng = rng.clone();
+        for (row, values) in (first_row..).zip(chunk.chunks_mut(row_len)) {
+            rng.set_word_pos(word_pos(row));
+            for value in values {
+                *value = rng.random_range(0.0..TAU);
+            }
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let rows_per_thread = rows
+        .div_ceil(threads)
+        .max((1 << 16) / row_len.max(1))
+        .max(1);
+    std::thread::scope(|scope| {
+        for (i, chunk) in phases.chunks_mut(rows_per_thread * row_len).enumerate() {
+            let fill = &fill;
+            scope.spawn(move || fill(i * rows_per_thread, chunk));
+        }
+    });
+}
+
+/// Bins of a synthesis window of `num_bins` bins within the bandpass.
+///
+/// # Arguments
+/// - `bandpass`: Lower and upper frequency of the bandpass (Hz), relative to the downmix frequency.
+/// - `sample_frequency`: Sample frequency (Hz).
+/// - `num_bins`: Number of bins of the synthesis window.
+pub(crate) fn bandpass_bins(
+    bandpass: [f64; 2],
+    sample_frequency: f64,
+    num_bins: usize,
+) -> RangeInclusive<usize> {
+    let scale = num_bins as f64 / sample_frequency;
+    let min = (bandpass[0] * scale).ceil() as usize;
+    let max = (bandpass[1] * scale).floor() as usize;
+    min..=max
 }
 
 /// Computes the frequency corresponding to a given FFT bin index.

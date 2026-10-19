@@ -1,5 +1,7 @@
 const LIGHT_SPEED: f32 = 299.792458; // light speed in megameters/s
 const TAU: f32 = 6.283185307179586;
+// number of consecutive bins of the bandpass evaluated by one invocation, written out in main
+const BLOCK: u32 = 16u;
 
 struct Receiver {
     x: f32,
@@ -23,20 +25,28 @@ struct Source {
 struct Params {
     sample_freq_mhz: f32,
     downmix_freq_mhz: f32,
-    bandpass_fmin_mhz: f32,
-    bandpass_fmax_mhz: f32,
-    receiver_noise_i: f32,
+    // first bin and number of bins of the bandpass
+    band_start: u32,
+    band_len: u32,
     num_bins: u32,
     sources_tile_size: u32,
-    source_offset: u32,
+    num_receivers: u32,
+    receiver_noise_i: f32,
 };
 
-@group(0) @binding(0) var<storage, read> receivers: array<Receiver>;
-@group(0) @binding(1) var<storage, read> sources: array<Source>;
-@group(0) @binding(2) var<storage, read> random_phase: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> receivers: array<Receiver>;
+@group(0) @binding(2) var<storage, read> sources: array<Source>;
+// field per source and bin of the bandpass, without the geometric delay
+@group(0) @binding(3) var<storage, read> fields: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> spectrum: array<vec2<f32>>;
-@group(0) @binding(5) var<storage, read_write> kahan_buffer: array<vec2<f32>>;
+
+fn complex_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        a.x * b.x - a.y * b.y,
+        a.x * b.y + a.y * b.x
+    );
+}
 
 fn fft_bin_frequency(bin: u32) -> f32 {
     let halfN: u32 = params.num_bins / 2u;
@@ -48,60 +58,88 @@ fn fft_bin_frequency(bin: u32) -> f32 {
     }
 }
 
-@compute @workgroup_size(256, 1, 1)
+// Adds the fields of the sources of a tile, delayed geometrically, to a block of BLOCK
+// consecutive bins of a receiver's spectrum.
+//
+// The invocations of a workgroup evaluate the same bins of different receivers, which read
+// the same fields. The geometric phase is advanced from bin to bin by a rotation. The
+// block is written out without loops, so that the fields of a source are loaded together.
+@compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let bin = id.x;
-    let receiver_idx = id.y;
+    let receiver_idx = id.x;
+    let first = id.y * BLOCK;
 
-    if (bin >= params.num_bins) {
+    if (receiver_idx >= params.num_receivers || first >= params.band_len) {
         return;
     }
-
-    let idx = receiver_idx * params.num_bins + bin;
-
-    let bin_freq = fft_bin_frequency(bin);
-    if (bin_freq < params.bandpass_fmin_mhz || bin_freq > params.bandpass_fmax_mhz) {
-        // bin frequency is filtered out
-        spectrum[idx] = vec2<f32>(0.0, 0.0);
-        return;
-    }
-    let phys_freq = bin_freq + params.downmix_freq_mhz;
 
     let rx = receivers[receiver_idx];
+    let position = vec3<f32>(rx.x, rx.y, rx.z);
+    let count = min(BLOCK, params.band_len - first);
+    let idx = receiver_idx * params.num_bins + params.band_start + first;
 
-    var sum = spectrum[idx];
-    var c = kahan_buffer[idx];
-
-    if (params.source_offset == 0) {
-        let noise_phase = sum.x;
-
-        // system noise contribution
-        let lambda = LIGHT_SPEED / phys_freq;
-        let eff_aperture = min(4.0, lambda*lambda/4.0);
-        let noise_ampl = sqrt(params.receiver_noise_i / eff_aperture);
-        sum = vec2<f32>(cos(noise_phase), sin(noise_phase)) * noise_ampl;
-        c = vec2<f32>(0.0, 0.0);
+    var sum: array<vec2<f32>, BLOCK>;
+    for (var b = 0u; b < count; b++) {
+        sum[b] = spectrum[idx + b];
     }
+
+    let first_freq = fft_bin_frequency(params.band_start + first) + params.downmix_freq_mhz;
+    let bin_width = params.sample_freq_mhz / f32(params.num_bins);
+    // the fields of a source are padded to a multiple of BLOCK bins
+    let stride = (params.band_len + BLOCK - 1u) / BLOCK * (BLOCK / 2u);
 
     for (var s = 0u; s < params.sources_tile_size; s++) {
-        let src = sources[s];
+        // geometric delay in µs
+        let delay = dot(sources[s].dir.xyz, position) / LIGHT_SPEED;
+        let phase = TAU * fract(first_freq * delay);
+        let step_phase = TAU * fract(bin_width * delay);
+        let step = vec2<f32>(cos(step_phase), sin(step_phase));
 
-        let gain = src.dir.z * src.dir.z; // cos^2(theta) gain model
-        let x = log(phys_freq / src.f0);
-        let ampl = gain * src.i0 * exp(x * (src.a1 + x * (src.a2 + x * src.a3)));
+        let base = s * stride + first / 2u;
+        let f0 = fields[base];
+        let f1 = fields[base + 1u];
+        let f2 = fields[base + 2u];
+        let f3 = fields[base + 3u];
+        let f4 = fields[base + 4u];
+        let f5 = fields[base + 5u];
+        let f6 = fields[base + 6u];
+        let f7 = fields[base + 7u];
 
-        let phase = random_phase[s * params.num_bins + bin]
-            + TAU * phys_freq * dot(src.dir, vec4<f32>(rx.x, rx.y, rx.z, 0.0)) / LIGHT_SPEED;
-
-        let y = vec2<f32>(cos(phase), sin(phase)) * sqrt(ampl);
-
-        // Kahan summation, better numerical accuracy when accumulating
-        let t = y - c;
-        let u = sum + t;
-        c = (u - sum) - t;
-        sum = u;
+        var rotation = vec2<f32>(cos(phase), sin(phase));
+        sum[0] += complex_mul(f0.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[1] += complex_mul(f0.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[2] += complex_mul(f1.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[3] += complex_mul(f1.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[4] += complex_mul(f2.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[5] += complex_mul(f2.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[6] += complex_mul(f3.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[7] += complex_mul(f3.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[8] += complex_mul(f4.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[9] += complex_mul(f4.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[10] += complex_mul(f5.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[11] += complex_mul(f5.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[12] += complex_mul(f6.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[13] += complex_mul(f6.zw, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[14] += complex_mul(f7.xy, rotation);
+        rotation = complex_mul(rotation, step);
+        sum[15] += complex_mul(f7.zw, rotation);
     }
 
-    spectrum[idx] = sum;
-    kahan_buffer[idx] = c;
+    for (var b = 0u; b < count; b++) {
+        spectrum[idx + b] = sum[b];
+    }
 }
