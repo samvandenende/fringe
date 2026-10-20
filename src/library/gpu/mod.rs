@@ -3,6 +3,7 @@
 use super::{
     Array, Phases, Source, Vec3,
     calibrator::{CalibratorWindow, ConditionedBuffer, segment_half_len},
+    response::{ArrayResponse, SkyTable},
     utils::bandpass_bins,
 };
 use num_complex::Complex32;
@@ -20,6 +21,8 @@ const SPECTRA_WORKGROUP_SIZE: u32 = 64;
 /// Number of consecutive bins evaluated by an invocation of the pass that adds the sources,
 /// `BLOCK` in compute_spectra.wgsl.
 const SPECTRA_BLOCK: u32 = 16;
+/// Flag in the group of a receiver whose beam has no polarization.
+const SCALAR_GROUP: u32 = 1 << 31;
 
 /// How the simulation is split up to fit within the device limits.
 ///
@@ -29,6 +32,7 @@ const SPECTRA_BLOCK: u32 = 16;
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BatchPlan {
     num_spectrum_bins: usize,
+    num_groups: usize,
     receivers_per_batch: usize,
     sources_per_tile: u32,
 }
@@ -36,12 +40,22 @@ struct BatchPlan {
 impl BatchPlan {
     /// Derives the largest batch and tile sizes that fit within the device limits and memory budget.
     ///
+    /// # Arguments
+    /// - `limits`: Limits of the device.
+    /// - `num_receivers`: Number of receivers of the array.
+    /// - `num_spectrum_bins`: Number of bins of the synthesis window.
+    /// - `num_groups`: Number of receiver groups.
+    /// - `beam_size`: Size (bytes) of the beam table of one source.
+    /// - `memory_budget`: Upper bound on the size of the large buffers.
+    ///
     /// # Panics
     /// Panics if not even a single spectrum fits on the device.
     fn new(
         limits: &wgpu::Limits,
         num_receivers: usize,
         num_spectrum_bins: usize,
+        num_groups: usize,
+        beam_size: u64,
         memory_budget: u64,
     ) -> Self {
         let max_buffer_size = limits
@@ -51,8 +65,9 @@ impl BatchPlan {
         let max_workgroups = limits.max_compute_workgroups_per_dimension as usize;
 
         let spectrum_size = (num_spectrum_bins * size_of::<Complex32>()) as u64;
-        let phases_size = (num_spectrum_bins * size_of::<f32>()) as u64;
-        let fields_size = (num_spectrum_bins * size_of::<Complex32>()) as u64;
+        // two phases per bin
+        let phases_size = (num_spectrum_bins * 2 * size_of::<f32>()) as u64;
+        let fields_size = (num_groups * num_spectrum_bins * size_of::<Complex32>()) as u64;
 
         assert!(
             num_spectrum_bins.div_ceil(WORKGROUP_SIZE_X as usize) <= max_workgroups,
@@ -67,16 +82,24 @@ impl BatchPlan {
             .min(max_workgroups)
             .min(num_receivers);
         let sources_per_tile = (max_buffer_size / phases_size)
-            .min(max_buffer_size / fields_size)
+            .min(max_buffer_size / fields_size.max(1))
+            .min(max_buffer_size / beam_size.max(1))
             .min(GPU_TILE_SIZE as u64) as u32;
         assert!(
+            sources_per_tile > 0,
+            "the beam table of a single source ({beam_size} bytes) does not fit in a GPU buffer of at most {max_buffer_size} bytes"
+        );
+
+        assert!(
             num_receivers.div_ceil(SPECTRA_WORKGROUP_SIZE as usize) <= max_workgroups
-                && num_spectrum_bins.div_ceil(SPECTRA_BLOCK as usize) <= max_workgroups,
+                && num_spectrum_bins.div_ceil(SPECTRA_BLOCK as usize) <= max_workgroups
+                && num_groups <= max_workgroups,
             "the array is too large to dispatch on the GPU"
         );
 
         BatchPlan {
             num_spectrum_bins,
+            num_groups,
             receivers_per_batch,
             sources_per_tile,
         }
@@ -87,11 +110,14 @@ impl BatchPlan {
     }
 
     fn phases_tile_buffer_size(&self) -> u64 {
-        (self.sources_per_tile as usize * self.num_spectrum_bins * size_of::<f32>()) as u64
+        (self.sources_per_tile as usize * self.num_spectrum_bins * 2 * size_of::<f32>()) as u64
     }
 
     fn fields_tile_buffer_size(&self) -> u64 {
-        (self.sources_per_tile as usize * self.num_spectrum_bins * size_of::<Complex32>()) as u64
+        (self.sources_per_tile as usize
+            * self.num_groups
+            * self.num_spectrum_bins
+            * size_of::<Complex32>()) as u64
     }
 
     fn noise_phases_buffer_size(&self) -> u64 {
@@ -126,6 +152,16 @@ impl From<Vec3> for Vec3Gpu {
     }
 }
 
+/// Position of a receiver and its group, with `SCALAR_GROUP` set for beams without polarization.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReceiverGpu {
+    x: f32,
+    y: f32,
+    z: f32,
+    group: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SourceGpu {
@@ -135,11 +171,15 @@ struct SourceGpu {
     spectral_index: f32,
     spectral_index_2: f32,
     spectral_index_3: f32,
+    polarization_fraction: f32,
+    polarization_angle: f32,
+    circular_fraction: f32,
+    rotation_measure: f32,
     _p: [u32; 3],
 }
 
-impl From<Source> for SourceGpu {
-    fn from(value: Source) -> Self {
+impl From<&Source> for SourceGpu {
+    fn from(value: &Source) -> Self {
         SourceGpu {
             direction: value.direction.into(),
             reference_frequency_MHz: (value.reference_frequency / 1e6) as f32,
@@ -147,6 +187,10 @@ impl From<Source> for SourceGpu {
             spectral_index: value.spectral_index as _,
             spectral_index_2: value.spectral_index_2 as _,
             spectral_index_3: value.spectral_index_3 as _,
+            polarization_fraction: value.polarization_fraction as _,
+            polarization_angle: value.polarization_angle as _,
+            circular_fraction: value.circular_fraction as _,
+            rotation_measure: value.rotation_measure as _,
             _p: [0; 3],
         }
     }
@@ -162,11 +206,15 @@ struct ComputeSpectraParams {
     spectrum_synthesis_window_size: u32,
     sources_tile_size: u32,
     num_receivers: u32,
-    array_system_noise_intensity: f32,
+    num_groups: u32,
+    beam_start_MHz: f32,
+    beam_step_MHz: f32,
+    beam_nodes: u32,
+    polarizations: u32,
 }
 
 impl ComputeSpectraParams {
-    fn new(array: &Array, phases: &Phases, num_spectrum_bins: usize) -> Self {
+    fn new(array: &Array, sky: &SkyTable, phases: &Phases, num_spectrum_bins: usize) -> Self {
         ComputeSpectraParams {
             array_sample_frequency_MHz: (array.sample_frequency / 1e6) as f32,
             array_downmix_frequency_MHz: (array.downmix_frequency / 1e6) as f32,
@@ -175,7 +223,11 @@ impl ComputeSpectraParams {
             spectrum_synthesis_window_size: num_spectrum_bins as _,
             sources_tile_size: 0,
             num_receivers: 0,
-            array_system_noise_intensity: array.system_noise_intensity as _,
+            num_groups: sky.num_groups as _,
+            beam_start_MHz: (sky.nodes.start / 1e6) as f32,
+            beam_step_MHz: (sky.nodes.step / 1e6) as f32,
+            beam_nodes: sky.nodes.count as _,
+            polarizations: phases.polarizations as _,
         }
     }
 
@@ -229,7 +281,8 @@ struct SegmentGpu {
     buffer_index: u32,
     buffer_frac: f32,
     carrier: f32,
-    amplitude: f32,
+    amplitude: [f32; 2],
+    _p: [u32; 3],
     delay_s: [f32; 4],
 }
 
@@ -242,7 +295,8 @@ struct ComputeCalibratorsParams {
     segment_len: u32,
     segment_half_len: f32,
     offset: u32,
-    _p: [u32; 2],
+    calibrator_begin: u32,
+    calibrator_end: u32,
 }
 
 #[repr(C)]
@@ -253,6 +307,11 @@ struct AccumulateCalibratorsParams {
     band_len: u32,
     num_bins: u32,
     scale: f32,
+    array_downmix_frequency_MHz: f32,
+    link_start_MHz: f32,
+    link_step_MHz: f32,
+    /// Number of frequency nodes of the link response, 0 for none.
+    link_nodes: u32,
     _p: [u32; 3],
 }
 
@@ -271,6 +330,8 @@ struct CalibratorBuffers {
     common: wgpu::Buffer,
     segments: wgpu::Buffer,
     transmit: wgpu::Buffer,
+    /// Link responses of one calibrator for a batch of receivers.
+    links: wgpu::Buffer,
     /// Conditioned buffers currently uploaded to `transmit`.
     uploaded: Vec<Arc<ConditionedBuffer>>,
 }
@@ -284,6 +345,7 @@ pub(crate) struct Runtime {
     receiver_buf: wgpu::Buffer,
     sources_tile_buf: wgpu::Buffer,
     phases_tile_buf: wgpu::Buffer,
+    beam_tile_buf: wgpu::Buffer,
     noise_phases_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     spectra_buf1: wgpu::Buffer,
@@ -317,18 +379,24 @@ impl Runtime {
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration used to size internal resources.
+    /// - `response`: Receive response of the array.
     /// - `frequency_resolution` - FFT oversampling factor.
     ///
     /// # Returns
     /// A newly initialized `Runtime`.
-    pub(crate) fn new(array: &Array, frequency_resolution: usize) -> Self {
-        Self::with_memory_budget(array, frequency_resolution, GPU_MEMORY_BUDGET)
+    pub(crate) fn new(
+        array: &Array,
+        response: &ArrayResponse,
+        frequency_resolution: usize,
+    ) -> Self {
+        Self::with_memory_budget(array, response, frequency_resolution, GPU_MEMORY_BUDGET)
     }
 
     /// Creates a new runtime instance that uses at most roughly `memory_budget` bytes of GPU memory.
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration used to size internal resources.
+    /// - `response`: Receive response of the array.
     /// - `frequency_resolution` - FFT oversampling factor.
     /// - `memory_budget` - Upper bound on the size of the large GPU buffers, in bytes.
     ///
@@ -336,21 +404,27 @@ impl Runtime {
     /// A newly initialized `Runtime`.
     pub(crate) fn with_memory_budget(
         array: &Array,
+        response: &ArrayResponse,
         frequency_resolution: usize,
         memory_budget: u64,
     ) -> Self {
         let (_instance, _adapter, device, queue) = pollster::block_on(init_gpu());
 
+        let beam_size =
+            (response.groups.len() * response.nodes.count * size_of::<[Complex32; 2]>()) as u64;
+        let num_spectrum_bins = array.sample_window_size * frequency_resolution;
         let plan = BatchPlan::new(
             &device.limits(),
             array.antenna_positions.len(),
-            array.sample_window_size * frequency_resolution,
+            num_spectrum_bins,
+            response.groups.len(),
+            beam_size,
             memory_budget,
         );
 
         let receiver_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Receivers"),
-            size: (plan.receivers_per_batch * size_of::<Vec3Gpu>()) as _,
+            size: (plan.receivers_per_batch * size_of::<ReceiverGpu>()) as _,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -369,6 +443,13 @@ impl Runtime {
             mapped_at_creation: false,
         });
 
+        let beam_tile_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Beam tile"),
+            size: plan.sources_per_tile as u64 * beam_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let noise_phases_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Noise phases"),
             size: plan.noise_phases_buffer_size(),
@@ -382,6 +463,30 @@ impl Runtime {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+
+        let scalar_groups = (0..response.groups.len())
+            .map(|g| response.is_scalar(g) as u32)
+            .collect::<Vec<_>>();
+        let scalar_groups_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Scalar groups"),
+            size: (scalar_groups.len() * size_of::<u32>()) as _,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&scalar_groups_buf, 0, bytemuck::cast_slice(&scalar_groups));
+
+        let noise_amplitudes = response
+            .noise_amplitudes
+            .iter()
+            .map(|&a| a as f32)
+            .collect::<Vec<_>>();
+        let noise_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Noise amplitudes"),
+            size: (noise_amplitudes.len() * size_of::<f32>()) as _,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&noise_buf, 0, bytemuck::cast_slice(&noise_amplitudes));
 
         let params_size = [
             size_of::<ComputeSpectraParams>(),
@@ -426,10 +531,12 @@ impl Runtime {
             &[
                 // params
                 uniform_entry(0),
-                // noise phases
+                // noise amplitudes
                 storage_entry(1),
+                // noise phases
+                storage_entry(2),
                 // output spectrum
-                storage_rw_entry(2),
+                storage_rw_entry(3),
             ],
         );
         let compute_noise_bindgroup = bind_group(
@@ -437,6 +544,7 @@ impl Runtime {
             &compute_noise_bgl,
             &[
                 params_binding::<ComputeSpectraParams>(&params_buf),
+                noise_buf.as_entire_binding(),
                 noise_phases_buf.as_entire_binding(),
                 spectra_buf1.as_entire_binding(),
             ],
@@ -456,8 +564,12 @@ impl Runtime {
                 storage_entry(1),
                 // random phase
                 storage_entry(2),
+                // beam table
+                storage_entry(3),
+                // scalar groups
+                storage_entry(4),
                 // fields
-                storage_rw_entry(3),
+                storage_rw_entry(5),
             ],
         );
         let compute_fields_bindgroup = bind_group(
@@ -467,6 +579,8 @@ impl Runtime {
                 params_binding::<ComputeSpectraParams>(&params_buf),
                 sources_tile_buf.as_entire_binding(),
                 phases_tile_buf.as_entire_binding(),
+                beam_tile_buf.as_entire_binding(),
+                scalar_groups_buf.as_entire_binding(),
                 fields_tile_buf.as_entire_binding(),
             ],
         );
@@ -557,6 +671,8 @@ impl Runtime {
                 storage_entry(1),
                 // spectrum
                 storage_rw_entry(2),
+                // link responses
+                storage_entry(3),
             ],
         );
         let accumulate_calibrators_pipeline = compute_pipeline(
@@ -587,6 +703,7 @@ impl Runtime {
             receiver_buf,
             sources_tile_buf,
             phases_tile_buf,
+            beam_tile_buf,
             noise_phases_buf,
             params_buf,
             spectra_buf1,
@@ -623,8 +740,9 @@ impl Runtime {
     /// For each batch, this method:
     /// - Uploads receiver geometry to the GPU
     /// - Uploads the system noise phases and initializes the spectra with the system noise
-    /// - Processes sources in tiles: computes the field of every source of the tile, then
-    ///   adds the fields, delayed geometrically, to the spectrum of every receiver
+    /// - Processes sources in tiles: computes the field of every source of the tile as
+    ///   received by every group, then adds the fields, delayed geometrically, to the
+    ///   spectrum of every receiver
     /// - Evaluates the calibrator signals, transforms them with a forward FFT
     ///   and adds them to the spectrum within the bandpass
     /// - Executes iterative inverse FFT stages (ping-pong buffering)
@@ -635,21 +753,38 @@ impl Runtime {
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration (positions, sampling parameters, etc.).
+    /// - `response`: Receive response of the array.
     /// - `sources`: List of signal sources contributing to the simulation.
+    /// - `sky`: Response of the receivers to the sources.
     /// - `calibrators`: Precomputed calibrator signals, if there are any calibrators.
     /// - `phases`: Precomputed phase information for system noise and sources.
     pub(crate) fn start(
         &mut self,
         array: &Array,
+        response: &ArrayResponse,
         sources: &[Source],
+        sky: &SkyTable,
         calibrators: Option<&Arc<CalibratorWindow>>,
         phases: &Phases,
     ) {
         let receivers = array
             .antenna_positions
             .iter()
-            .map(|&p| p.into())
-            .collect::<Vec<Vec3Gpu>>();
+            .zip(&response.antenna_groups)
+            .map(|(&p, &group)| {
+                let scalar = if response.is_scalar(group as usize) {
+                    SCALAR_GROUP
+                } else {
+                    0
+                };
+                ReceiverGpu {
+                    x: p.x as _,
+                    y: p.y as _,
+                    z: p.z as _,
+                    group: group | scalar,
+                }
+            })
+            .collect::<Vec<_>>();
         let num_spectrum_bins = self.plan.num_spectrum_bins;
 
         // discard the results of a previous run that was never finished
@@ -657,7 +792,7 @@ impl Runtime {
             self.read_back(stale);
         }
         self.samples = Vec::with_capacity(receivers.len());
-        let mut params = ComputeSpectraParams::new(array, phases, num_spectrum_bins);
+        let mut params = ComputeSpectraParams::new(array, sky, phases, num_spectrum_bins);
         let calibrators_bindgroup = calibrators.map(|window| self.upload_calibrators(window));
 
         for (batch_idx, receivers_batch) in
@@ -670,6 +805,7 @@ impl Runtime {
                 receivers_batch,
                 receiver_offset,
                 sources,
+                sky,
                 calibrators.zip(calibrators_bindgroup.as_ref()),
                 phases,
                 &mut params,
@@ -733,10 +869,16 @@ impl Runtime {
             * size_of::<SegmentGpu>()) as u64;
         let transmit_size = (buffer_offset as usize * size_of::<Complex32>()) as u64;
         let common_size = (common.len() * size_of::<CommonSampleGpu>()) as u64;
+        let links_size = if window.flat {
+            size_of::<Complex32>() as u64
+        } else {
+            (self.plan.receivers_per_batch * window.nodes.count * size_of::<Complex32>()) as u64
+        };
         for (size, what) in [
             (segments_size, "calibrator segments"),
             (transmit_size, "calibrator transmit buffers"),
             (common_size, "calibrator samples"),
+            (links_size, "calibrator link responses"),
         ] {
             assert!(
                 size <= max_binding_size,
@@ -759,6 +901,7 @@ impl Runtime {
                 common: empty("Calibrator samples"),
                 segments: empty("Calibrator segments"),
                 transmit: empty("Calibrator transmit buffers"),
+                links: empty("Calibrator link responses"),
                 uploaded: Vec::new(),
             }
         });
@@ -782,6 +925,7 @@ impl Runtime {
         );
         ensure_size(&mut buffers.common, common_size);
         ensure_size(&mut buffers.segments, segments_size);
+        ensure_size(&mut buffers.links, links_size);
         let reallocated = ensure_size(&mut buffers.transmit, transmit_size);
 
         let unchanged = buffers.uploaded.len() == num_calibrators
@@ -831,6 +975,7 @@ impl Runtime {
     /// - `receivers`: Positions of the receivers in the batch.
     /// - `receiver_offset`: Index of the first receiver of the batch in the array.
     /// - `sources`: List of signal sources contributing to the simulation.
+    /// - `sky`: Response of the receivers to the sources.
     /// - `calibrators`: Precomputed calibrator signals and the bind group of the calibrator
     ///   compute pass, if there are any calibrators.
     /// - `phases`: Precomputed phase information for system noise and sources.
@@ -843,9 +988,10 @@ impl Runtime {
     fn submit_batch(
         &self,
         array: &Array,
-        receivers: &[Vec3Gpu],
+        receivers: &[ReceiverGpu],
         receiver_offset: usize,
         sources: &[Source],
+        sky: &SkyTable,
         calibrators: Option<(&Arc<CalibratorWindow>, &wgpu::BindGroup)>,
         phases: &Phases,
         params: &mut ComputeSpectraParams,
@@ -885,7 +1031,7 @@ impl Runtime {
             // upload source tile
             let sources_slice = sources[tile.clone()]
                 .iter()
-                .map(|source| source.clone().into())
+                .map(SourceGpu::from)
                 .collect::<Vec<SourceGpu>>();
             self.queue.write_buffer(
                 &self.sources_tile_buf,
@@ -893,9 +1039,16 @@ impl Runtime {
                 bytemuck::cast_slice(&sources_slice),
             );
             // upload source phase tile
-            let phases_slice = &phases.sources[tile.start * band_len..tile.end * band_len];
+            let phases_per_source = band_len * phases.polarizations;
+            let phases_slice =
+                &phases.sources[tile.start * phases_per_source..tile.end * phases_per_source];
             self.queue
                 .write_buffer(&self.phases_tile_buf, 0, bytemuck::cast_slice(phases_slice));
+            // upload beam tile
+            let beam_per_source = sky.num_groups * sky.nodes.count;
+            let beam_slice = &sky.jones[tile.start * beam_per_source..tile.end * beam_per_source];
+            self.queue
+                .write_buffer(&self.beam_tile_buf, 0, bytemuck::cast_slice(beam_slice));
             // upload params
             params.update(tile_size, receivers.len() as _);
             self.queue
@@ -906,7 +1059,11 @@ impl Runtime {
                     (
                         &self.compute_fields_pipeline,
                         &self.compute_fields_bindgroup,
-                        [(band_len as u32).div_ceil(WORKGROUP_SIZE_X), tile_size, 1],
+                        [
+                            (band_len as u32).div_ceil(WORKGROUP_SIZE_X),
+                            tile_size,
+                            sky.num_groups as u32,
+                        ],
                     ),
                     (
                         &self.compute_spectra_pipeline,
@@ -969,6 +1126,9 @@ impl Runtime {
     /// Evaluates the calibrator signals of a batch of receivers, transforms them to the
     /// frequency domain and adds them to the spectrum in `spectra_buf1` within the bandpass.
     ///
+    /// If the link responses depend on frequency, the calibrators are evaluated one at a
+    /// time and filtered by their link response.
+    ///
     /// # Arguments
     /// - `array`: Antenna array configuration.
     /// - `window`: Precomputed calibrator signals.
@@ -985,7 +1145,8 @@ impl Runtime {
     ) {
         let num_spectrum_bins = self.plan.num_spectrum_bins;
         let band = bandpass_bins(array.bandpass, array.sample_frequency, num_spectrum_bins);
-        let segments_per_receiver = window.calibrators.len() * window.num_segments;
+        let num_calibrators = window.calibrators.len();
+        let segments_per_receiver = num_calibrators * window.num_segments;
         let segments = window.segments[receiver_offset * segments_per_receiver
             ..(receiver_offset + num_receivers) * segments_per_receiver]
             .iter()
@@ -993,7 +1154,8 @@ impl Runtime {
                 buffer_index: s.buffer_index,
                 buffer_frac: s.buffer_frac as _,
                 carrier: s.carrier as _,
-                amplitude: s.amplitude as _,
+                amplitude: [s.amplitude.re as _, s.amplitude.im as _],
+                _p: [0; _],
                 delay_s: s.delay.map(|d| d as _),
             })
             .collect::<Vec<_>>();
@@ -1004,55 +1166,82 @@ impl Runtime {
         self.queue
             .write_buffer(&buffers.segments, 0, bytemuck::cast_slice(&segments));
 
-        let params = ComputeCalibratorsParams {
-            num_bins: num_spectrum_bins as _,
-            num_calibrators: window.calibrators.len() as _,
-            num_segments: window.num_segments as _,
-            segment_len: window.segment_len as _,
-            segment_half_len: segment_half_len(window.segment_len) as _,
-            offset: window.offset as _,
-            _p: [0; _],
+        // all calibrators at once, or one at a time with their link response
+        let passes: Vec<_> = if window.flat {
+            std::iter::once(0..num_calibrators).collect()
+        } else {
+            (0..num_calibrators).map(|c| c..c + 1).collect()
         };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.submit_pass(
-            &self.compute_calibrators_pipeline,
-            bindgroup,
-            num_spectrum_bins,
-            num_receivers,
-            None,
-        );
+        for calibrators in passes {
+            let params = ComputeCalibratorsParams {
+                num_bins: num_spectrum_bins as _,
+                num_calibrators: num_calibrators as _,
+                num_segments: window.num_segments as _,
+                segment_len: window.segment_len as _,
+                segment_half_len: segment_half_len(window.segment_len) as _,
+                offset: window.offset as _,
+                calibrator_begin: calibrators.start as _,
+                calibrator_end: calibrators.end as _,
+            };
+            self.queue
+                .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+            self.submit_pass(
+                &self.compute_calibrators_pipeline,
+                bindgroup,
+                num_spectrum_bins,
+                num_receivers,
+                None,
+            );
 
-        let signal_spectrum =
-            self.submit_fft(&self.spectra_buf2, &self.spectra_buf3, num_receivers, false);
+            let signal_spectrum =
+                self.submit_fft(&self.spectra_buf2, &self.spectra_buf3, num_receivers, false);
 
-        let params = AccumulateCalibratorsParams {
-            array_sample_frequency_MHz: (array.sample_frequency / 1e6) as f32,
-            band_start: *band.start() as _,
-            band_len: band.clone().count() as _,
-            num_bins: num_spectrum_bins as _,
-            // undo the scaling of the inverse FFT and the normalization of the output samples
-            scale: (num_spectrum_bins as f32).sqrt().recip(),
-            _p: [0; _],
-        };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let accumulate_bindgroup = bind_group(
-            &self.device,
-            &self.accumulate_calibrators_bgl,
-            &[
-                params_binding::<AccumulateCalibratorsParams>(&self.params_buf),
-                signal_spectrum.as_entire_binding(),
-                self.spectra_buf1.as_entire_binding(),
-            ],
-        );
-        self.submit_pass(
-            &self.accumulate_calibrators_pipeline,
-            &accumulate_bindgroup,
-            num_spectrum_bins,
-            num_receivers,
-            None,
-        );
+            let link_nodes = if window.flat {
+                0
+            } else {
+                let nodes = window.nodes.count;
+                let begin = (calibrators.start * window.num_antennas + receiver_offset) * nodes;
+                let links = window.links[begin..begin + num_receivers * nodes]
+                    .iter()
+                    .map(|l| Complex32::new(l.re as _, l.im as _))
+                    .collect::<Vec<_>>();
+                self.queue
+                    .write_buffer(&buffers.links, 0, bytemuck::cast_slice(&links));
+                nodes as u32
+            };
+            let params = AccumulateCalibratorsParams {
+                array_sample_frequency_MHz: (array.sample_frequency / 1e6) as f32,
+                band_start: *band.start() as _,
+                band_len: band.clone().count() as _,
+                num_bins: num_spectrum_bins as _,
+                // undo the scaling of the inverse FFT and the normalization of the output samples
+                scale: (num_spectrum_bins as f32).sqrt().recip(),
+                array_downmix_frequency_MHz: (array.downmix_frequency / 1e6) as f32,
+                link_start_MHz: (window.nodes.start / 1e6) as f32,
+                link_step_MHz: (window.nodes.step / 1e6) as f32,
+                link_nodes,
+                _p: [0; _],
+            };
+            self.queue
+                .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+            let accumulate_bindgroup = bind_group(
+                &self.device,
+                &self.accumulate_calibrators_bgl,
+                &[
+                    params_binding::<AccumulateCalibratorsParams>(&self.params_buf),
+                    signal_spectrum.as_entire_binding(),
+                    self.spectra_buf1.as_entire_binding(),
+                    buffers.links.as_entire_binding(),
+                ],
+            );
+            self.submit_pass(
+                &self.accumulate_calibrators_pipeline,
+                &accumulate_bindgroup,
+                num_spectrum_bins,
+                num_receivers,
+                None,
+            );
+        }
     }
 
     /// Submits the stages of an inverse or forward FFT.
@@ -1326,6 +1515,7 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::model::{JY_M2_PER_KELVIN, NoiseTemperature};
     use crate::library::{Calibrator, Transmitter};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -1336,18 +1526,37 @@ mod tests {
             downmix_frequency: 45e6,
             bandpass: [5e6, 55e6],
             sample_window_size,
-            system_noise_intensity: 1.0,
+            system_noise_temperature: NoiseTemperature::Constant(1.0 / JY_M2_PER_KELVIN),
             antenna_positions: (0..num_antennas)
                 .map(|i| Vec3::new(i as f64 * 3.0, (i % 7) as f64 * 5.0, 0.0))
                 .collect(),
+            beams: vec![crate::library::Beam::cos_squared()],
+            antenna_beams: Vec::new(),
+            antenna_orientations: Vec::new(),
+            horizon: None,
         }
+    }
+
+    fn response(array: &Array, frequency_resolution: usize) -> ArrayResponse {
+        ArrayResponse::new(array, array.sample_window_size * frequency_resolution)
     }
 
     fn test_sources(num_sources: usize) -> Vec<Source> {
         (0..num_sources)
             .map(|i| {
                 let direction = Vec3::from_ra_dec(i as f64 * 0.1, 0.5 + i as f64 * 0.01);
-                Source::new(direction, 75e6, 1.0 + i as f64 * 0.01, -0.7, -0.3, 0.1)
+                Source::new(
+                    direction,
+                    75e6,
+                    1.0 + i as f64 * 0.01,
+                    -0.7,
+                    -0.3,
+                    0.1,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
             })
             .collect()
     }
@@ -1363,6 +1572,7 @@ mod tests {
                 .collect(),
             Some(30e6),
             0.0,
+            None,
         );
         let tone = Transmitter::new(
             80e6 + variant * 1e6,
@@ -1371,6 +1581,7 @@ mod tests {
             vec![Complex32::ONE],
             None,
             0.0,
+            None,
         );
         vec![
             Calibrator::new(
@@ -1379,6 +1590,7 @@ mod tests {
                 Some(Vec3::new(1600.0, -300.0, 10.0)),
                 Some(Vec3::new(0.0, 0.0, -25.0)),
                 0.0,
+                None,
             ),
             Calibrator::new(
                 Vec3::new(-3e4, 5e3 * variant, 2e5),
@@ -1386,6 +1598,7 @@ mod tests {
                 Some(Vec3::new(-200.0, 1500.0, 0.0)),
                 None,
                 0.0,
+                None,
             ),
         ]
     }
@@ -1401,6 +1614,7 @@ mod tests {
             .collect::<Vec<_>>();
         Arc::new(CalibratorWindow::new(
             array,
+            &response(array, frequency_resolution),
             calibrators,
             &buffers,
             array.sample_window_size * frequency_resolution,
@@ -1415,9 +1629,17 @@ mod tests {
         frequency_resolution: usize,
     ) -> Vec<Vec<Complex32>> {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let phases = Phases::new(&mut rng, array, sources.len(), frequency_resolution);
+        let response = Arc::new(response(array, frequency_resolution));
+        let phases = Phases::new(
+            &mut rng,
+            array,
+            sources.len(),
+            frequency_resolution,
+            response.source_polarizations(),
+        );
         let calibrators = calibrator_window(array, &test_calibrators(0.0), frequency_resolution);
-        runtime.start(array, sources, Some(&calibrators), &phases);
+        let sky = Arc::new(SkyTable::new(&response, sources));
+        runtime.start(array, &response, sources, &sky, Some(&calibrators), &phases);
         runtime.finish()
     }
 
@@ -1434,32 +1656,39 @@ mod tests {
         (error / total).sqrt()
     }
 
-    #[test]
-    fn matches_cpu_runtime() {
+    /// Compares the GPU runtime with the CPU runtime for an array.
+    fn assert_matches_cpu(
+        array: &Array,
+        sources: &[Source],
+        calibrators: &dyn Fn(f64) -> Vec<Calibrator>,
+    ) {
         let frequency_resolution = 4;
-        let array = Array {
-            system_noise_intensity: 0.0,
-            ..test_array(9, 1 << 10)
-        };
-        let sources = test_sources(3);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let phases = Phases::new(&mut rng, &array, sources.len(), frequency_resolution);
-        let mut gpu = Runtime::new(&array, frequency_resolution);
+        let response = Arc::new(response(array, frequency_resolution));
+        let phases = Phases::new(
+            &mut rng,
+            array,
+            sources.len(),
+            frequency_resolution,
+            response.source_polarizations(),
+        );
+        let sky = Arc::new(SkyTable::new(&response, sources));
+        let no_sky = Arc::new(SkyTable::new(&response, &[]));
+        let mut gpu = Runtime::new(array, &response, frequency_resolution);
         let mut cpu = super::super::cpu::Runtime::new(frequency_resolution);
 
         // the second run changes the transmit buffers, which must be uploaded again
         for variant in [0.0, 1.0] {
-            let calibrators =
-                calibrator_window(&array, &test_calibrators(variant), frequency_resolution);
-            gpu.start(&array, &sources, Some(&calibrators), &phases);
-            cpu.start(&array, &sources, Some(&calibrators), &phases);
+            let calibrators = calibrator_window(array, &calibrators(variant), frequency_resolution);
+            gpu.start(array, &response, sources, &sky, Some(&calibrators), &phases);
+            cpu.start(array, &response, sources, &sky, Some(&calibrators), &phases);
             let error = relative_rms_error(&gpu.finish(), &cpu.finish());
             println!("relative rms error {:.1} dB", 20.0 * error.log10());
             assert!(error < 1e-4);
 
             // calibrators only
-            gpu.start(&array, &[], Some(&calibrators), &phases);
-            cpu.start(&array, &[], Some(&calibrators), &phases);
+            gpu.start(array, &response, &[], &no_sky, Some(&calibrators), &phases);
+            cpu.start(array, &response, &[], &no_sky, Some(&calibrators), &phases);
             let error = relative_rms_error(&gpu.finish(), &cpu.finish());
             println!(
                 "calibrators only: relative rms error {:.1} dB",
@@ -1470,10 +1699,81 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpu_runtime() {
+        let array = Array {
+            system_noise_temperature: NoiseTemperature::Constant(0.0),
+            ..test_array(9, 1 << 10)
+        };
+        assert_matches_cpu(&array, &test_sources(3), &test_calibrators);
+    }
+
+    /// Dual-polarized antennas with a tabulated beam, polarized sources, and calibrators
+    /// with tabulated and analytic transmitter beams, so that the link responses depend on
+    /// frequency.
+    #[test]
+    fn matches_cpu_runtime_with_beams() {
+        use crate::library::beam::tests::tabulate;
+        use crate::library::{Attitude, Beam, Orientation};
+        use num_complex::Complex64;
+
+        let beam = tabulate(&Beam::short_dipole(), &[40e6, 70e6, 110e6], 2.0, 2.0);
+        let base = test_array(5, 1 << 10);
+        let mut array = Array::dual_polarized(
+            base.antenna_positions.clone(),
+            base.sample_frequency,
+            base.downmix_frequency,
+            base.bandpass[0],
+            base.bandpass[1],
+            base.sample_window_size,
+            NoiseTemperature::Constant(0.0),
+            Some(beam.clone()),
+            Some(
+                (0..5)
+                    .map(|i| Orientation::identity().rotated(i as f64 * 0.3))
+                    .collect(),
+            ),
+            None,
+        );
+        // one antenna with the legacy beam
+        array.beams.push(Beam::cos_squared());
+        array.antenna_beams = vec![0; array.antenna_positions.len()];
+        array.antenna_beams[3] = 1;
+        array.validate();
+
+        let sources = (0..4)
+            .map(|i| {
+                Source::new(
+                    Vec3::from_ra_dec(i as f64 * 0.7, 0.4 + i as f64 * 0.1),
+                    75e6,
+                    1.0 + i as f64,
+                    -0.7,
+                    0.0,
+                    0.0,
+                    0.2 * i as f64,
+                    0.3 * i as f64,
+                    0.1,
+                    2.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let calibrators = |variant: f64| {
+            let mut calibrators = test_calibrators(variant);
+            calibrators[0].transmitter.beam = Some(beam.clone());
+            calibrators[0].attitude = Attitude::point_at(Vec3::default(), Vec3::new(1.0, 0.0, 0.0));
+            calibrators[1].transmitter.beam = Some(Beam::isotropic(
+                Complex64::new(1.0, 0.0),
+                Complex64::new(0.0, -1.0),
+            ));
+            calibrators
+        };
+        assert_matches_cpu(&array, &sources, &calibrators);
+    }
+
+    #[test]
     fn batch_plan_respects_default_limits() {
         let limits = wgpu::Limits::default();
         let num_spectrum_bins = (1 << 14) * 4;
-        let plan = BatchPlan::new(&limits, 512, num_spectrum_bins, u64::MAX);
+        let plan = BatchPlan::new(&limits, 512, num_spectrum_bins, 1, 16, u64::MAX);
 
         assert!(plan.spectra_buffer_size() <= limits.max_storage_buffer_binding_size);
         assert!(plan.phases_tile_buffer_size() <= limits.max_storage_buffer_binding_size);
@@ -1483,14 +1783,14 @@ mod tests {
 
     #[test]
     fn batch_plan_caps_dispatch_size() {
-        let plan = BatchPlan::new(&wgpu::Limits::default(), 1_000_000, 16, u64::MAX);
+        let plan = BatchPlan::new(&wgpu::Limits::default(), 1_000_000, 16, 1, 16, u64::MAX);
         assert_eq!(plan.receivers_per_batch, 65535);
     }
 
     #[test]
     #[should_panic(expected = "does not fit")]
     fn batch_plan_rejects_oversized_spectrum() {
-        BatchPlan::new(&wgpu::Limits::default(), 1, 1 << 20, 1 << 20);
+        BatchPlan::new(&wgpu::Limits::default(), 1, 1 << 20, 1, 16, 1 << 20);
     }
 
     #[test]
@@ -1500,12 +1800,14 @@ mod tests {
         let sources = test_sources(300);
         let num_spectrum_bins = (array.sample_window_size * frequency_resolution) as u64;
 
-        let mut unbatched = Runtime::new(&array, frequency_resolution);
+        let response = response(&array, frequency_resolution);
+        let mut unbatched = Runtime::new(&array, &response, frequency_resolution);
         assert_eq!(unbatched.plan.receivers_per_batch, 37);
 
         // room for 5 receivers per batch and 5 sources per tile
         let budget = NUM_LARGE_BUFFERS * num_spectrum_bins * 8 * 5;
-        let mut batched = Runtime::with_memory_budget(&array, frequency_resolution, budget);
+        let mut batched =
+            Runtime::with_memory_budget(&array, &response, frequency_resolution, budget);
         assert_eq!(batched.plan.receivers_per_batch, 5);
         assert_eq!(batched.plan.sources_per_tile, 5);
 
@@ -1526,7 +1828,11 @@ mod tests {
         let frequency_resolution = 4;
         let array = test_array(512, 1 << 14);
         let sources = test_sources(4);
-        let mut runtime = Runtime::new(&array, frequency_resolution);
+        let mut runtime = Runtime::new(
+            &array,
+            &response(&array, frequency_resolution),
+            frequency_resolution,
+        );
         let samples = simulate(&mut runtime, &array, &sources, frequency_resolution);
         assert_eq!(samples.len(), 512);
         assert!(samples.iter().all(|s| s.len() == 1 << 14));

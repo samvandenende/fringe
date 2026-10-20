@@ -2,7 +2,7 @@ use num_complex::{Complex32, Complex64};
 use rustfft::{Fft, FftPlanner};
 use std::{
     f64::consts::TAU,
-    ops::{Range, RangeInclusive},
+    ops::RangeInclusive,
     sync::Arc,
     thread::{self, JoinHandle},
 };
@@ -12,6 +12,7 @@ use crate::library::normalize_and_truncate;
 use super::{
     Array, Phases, Source, Vec3,
     calibrator::CalibratorWindow,
+    response::{ArrayResponse, SkyTable, field_factors},
     utils::{bandpass_bins, fft_bin_frequency},
 };
 
@@ -44,12 +45,15 @@ struct Window {
     bandpass: [f64; 2],
     sample_window_size: usize,
     spectrum_size: usize,
-    system_noise_intensity: f64,
     antenna_positions: Vec<Vec3>,
+    response: Arc<ArrayResponse>,
     sources: Vec<Source>,
+    sky: Arc<SkyTable>,
     calibrators: Option<Arc<CalibratorWindow>>,
     system_noise_phases: Arc<Vec<f32>>,
     source_phases: Arc<Vec<f32>>,
+    /// Number of phases per source and bin.
+    polarizations: usize,
     fft: Arc<dyn Fft<f32>>,
     calibrator_fft: Arc<dyn Fft<f64>>,
 }
@@ -64,6 +68,16 @@ impl Window {
     fn bandpass_bins(&self) -> RangeInclusive<usize> {
         bandpass_bins(self.bandpass, self.sample_frequency, self.spectrum_size)
     }
+}
+
+/// Field of a source in one bin of the bandpass, including its random phases.
+#[derive(Clone, Copy, Default)]
+struct Field {
+    /// Field `(E_north, E_east)` received by groups with polarization.
+    north: Complex32,
+    east: Complex32,
+    /// Field received by groups without polarization, which receive half the flux density.
+    scalar: Complex32,
 }
 
 /// Rounds a complex value to single precision.
@@ -95,13 +109,17 @@ impl Runtime {
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration (positions, sampling parameters, etc.).
+    /// - `response`: Receive response of the array.
     /// - `sources`: List of signal sources contributing to the simulation.
+    /// - `sky`: Response of the receivers to the sources.
     /// - `calibrators`: Precomputed calibrator signals, if there are any calibrators.
     /// - `phases`: Precomputed phase information for system noise and sources.
     pub(crate) fn start(
         &mut self,
         array: &Array,
+        response: &Arc<ArrayResponse>,
         sources: &[Source],
+        sky: &Arc<SkyTable>,
         calibrators: Option<&Arc<CalibratorWindow>>,
         phases: &Phases,
     ) {
@@ -112,12 +130,14 @@ impl Runtime {
             bandpass: array.bandpass,
             sample_window_size: array.sample_window_size,
             spectrum_size,
-            system_noise_intensity: array.system_noise_intensity,
             antenna_positions: array.antenna_positions.clone(),
+            response: response.clone(),
             sources: sources.to_vec(),
+            sky: sky.clone(),
             calibrators: calibrators.cloned(),
             system_noise_phases: phases.system_noise.clone(),
             source_phases: phases.sources.clone(),
+            polarizations: phases.polarizations,
             fft: self.fft_planner.plan_fft_inverse(spectrum_size),
             calibrator_fft: self.calibrator_fft_planner.plan_fft_forward(spectrum_size),
         };
@@ -147,13 +167,19 @@ impl Runtime {
 /// then combined with the receiver noise and the calibrators, transformed to the time domain
 /// and truncated to the sample window.
 ///
-/// The fields are computed in double precision, but summed in single precision, like the
-/// output samples. The fields of a source and the source spectra of an antenna are stored as
-/// the real parts of the bins of the bandpass followed by their imaginary parts.
+/// The fields are computed in double precision, but received and summed in single
+/// precision, like the output samples. The source spectra of an antenna are stored as the
+/// real parts of the bins of the bandpass followed by their imaginary parts.
 fn simulate_window(window: &Window) -> Vec<Vec<Complex32>> {
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let num_antennas = window.antenna_positions.len();
-    let num_band_bins = window.bandpass_bins().count();
+    let band = window.bandpass_bins();
+    let num_band_bins = band.clone().count();
+    // the location of every bin of the bandpass in the frequency nodes of the beams
+    let nodes: Vec<(usize, f64)> = band
+        .clone()
+        .map(|bin| window.sky.nodes.locate(window.frequency(bin)))
+        .collect();
 
     let batch_len = (ANTENNA_BATCH_BYTES / (num_band_bins * size_of::<Complex32>()).max(1))
         .clamp(1, num_antennas);
@@ -162,7 +188,7 @@ fn simulate_window(window: &Window) -> Vec<Vec<Complex32>> {
         let antennas = first..(first + batch_len).min(num_antennas);
         let mut spectra = vec![0.0; antennas.len() * 2 * num_band_bins];
         if num_band_bins > 0 {
-            add_sources(&mut spectra, antennas.clone(), window, threads);
+            add_sources(&mut spectra, antennas.clone(), window, &nodes, threads);
         }
 
         // receiver noise and calibrators, and the transform to the time domain
@@ -198,23 +224,29 @@ fn simulate_window(window: &Window) -> Vec<Vec<Complex32>> {
 ///   parts followed by imaginary parts.
 /// - `antennas`: Indices of the antennas of the batch.
 /// - `window`: Inputs of the sample window.
+/// - `nodes`: Location of every bin of the bandpass in the frequency nodes of the beams.
 /// - `threads`: Number of threads to use.
-fn add_sources(spectra: &mut [f32], antennas: Range<usize>, window: &Window, threads: usize) {
-    let num_band_bins = window.bandpass_bins().count();
-    let field_len = 2 * num_band_bins;
-    let tile_len = (FIELD_TILE_BYTES / (num_band_bins * size_of::<Complex32>())).max(1);
-    let mut fields = vec![0.0; tile_len.min(window.sources.len()) * field_len];
+fn add_sources(
+    spectra: &mut [f32],
+    antennas: std::ops::Range<usize>,
+    window: &Window,
+    nodes: &[(usize, f64)],
+    threads: usize,
+) {
+    let num_band_bins = nodes.len();
+    let tile_len = (FIELD_TILE_BYTES / (num_band_bins * size_of::<Field>())).max(1);
+    let mut fields = vec![Field::default(); tile_len.min(window.sources.len()) * num_band_bins];
     for first in (0..window.sources.len()).step_by(tile_len) {
         let tile = first..(first + tile_len).min(window.sources.len());
-        let fields = &mut fields[..tile.len() * field_len];
+        let fields = &mut fields[..tile.len() * num_band_bins];
 
         let per_thread = tile.len().div_ceil(threads);
         thread::scope(|scope| {
-            for (i, fields) in fields.chunks_mut(per_thread * field_len).enumerate() {
+            for (i, fields) in fields.chunks_mut(per_thread * num_band_bins).enumerate() {
                 let first = tile.start + i * per_thread;
                 scope.spawn(move || {
-                    for (source, field) in (first..).zip(fields.chunks_mut(field_len)) {
-                        source_field(field, source, window);
+                    for (source, fields) in (first..).zip(fields.chunks_mut(num_band_bins)) {
+                        source_fields(fields, source, window);
                     }
                 });
             }
@@ -223,79 +255,134 @@ fn add_sources(spectra: &mut [f32], antennas: Range<usize>, window: &Window, thr
         let fields = &*fields;
         let per_thread = antennas.len().div_ceil(threads);
         thread::scope(|scope| {
-            for (i, spectra) in spectra.chunks_mut(per_thread * field_len).enumerate() {
+            for (i, spectra) in spectra
+                .chunks_mut(per_thread * 2 * num_band_bins)
+                .enumerate()
+            {
                 let first = antennas.start + i * per_thread;
                 let tile = tile.clone();
                 scope.spawn(move || {
-                    receive_sources(spectra, first, window, tile, fields);
+                    receive_sources(spectra, first, window, nodes, tile, fields);
                 });
             }
         });
     }
 }
 
-/// Computes the field of a source in every bin of the bandpass, including its random
-/// phases, received with a cos²(θ) gain.
+/// Computes the field of a source in every bin of the bandpass.
 ///
-/// # Arguments
-/// - `field`: Field of the source, real parts followed by imaginary parts.
-/// - `s`: Index of the source.
-/// - `window`: Inputs of the sample window.
-fn source_field(field: &mut [f32], s: usize, window: &Window) {
+/// The field of each source has two independent random phases per bin, for its north and
+/// east polarization, combined according to its Stokes parameters. Receivers without
+/// polarization receive half the flux density of every source.
+fn source_fields(fields: &mut [Field], s: usize, window: &Window) {
     let source = &window.sources[s];
-    let num_band_bins = field.len() / 2;
-    let phases = &window.source_phases[s * num_band_bins..(s + 1) * num_band_bins];
-    let z = source.direction.normalized().z;
-    let gain = z * z;
-    let (field_re, field_im) = field.split_at_mut(num_band_bins);
-    for (((re, im), bin), &phase) in field_re
+    let polarizations = window.polarizations;
+    let phases =
+        &window.source_phases[s * fields.len() * polarizations..][..fields.len() * polarizations];
+    let unpolarized = source.polarization_fraction == 0.0 && source.circular_fraction == 0.0;
+    for ((field, bin), phases) in fields
         .iter_mut()
-        .zip(field_im)
         .zip(window.bandpass_bins())
-        .zip(phases)
+        .zip(phases.chunks_exact(polarizations))
     {
-        let amplitude = (gain * source.intensity_unchecked(window.frequency(bin))).sqrt();
-        let value = to_f32(Complex64::from_polar(amplitude, phase as f64));
-        (*re, *im) = (value.re, value.im);
+        let frequency = window.frequency(bin);
+        let amplitude = (0.5 * source.intensity_unchecked(frequency)).sqrt();
+        let z1 = Complex64::from_polar(1.0, phases[0] as f64);
+        field.scalar = to_f32(z1 * amplitude);
+        if polarizations == 2 {
+            let z2 = Complex64::from_polar(1.0, phases[1] as f64);
+            let (north, east) = if unpolarized {
+                (z1 * amplitude, z2 * amplitude)
+            } else {
+                let (l11, l21, l22) = field_factors(source.stokes_unchecked(frequency));
+                (z1 * l11, z1 * l21 + z2 * l22)
+            };
+            (field.north, field.east) = (to_f32(north), to_f32(east));
+        }
     }
 }
 
-/// Adds the sources of a tile to the spectra of consecutive antennas, delayed geometrically.
+/// Adds the sources of a tile to the spectra of consecutive antennas.
+///
+/// Every antenna receives the field of a source through the Jones row of its group, delayed
+/// geometrically.
 ///
 /// # Arguments
 /// - `spectra`: Spectra of the bins within the bandpass, per antenna, real parts followed by
 ///   imaginary parts.
 /// - `first_antenna`: Index of the antenna of the first spectrum.
 /// - `window`: Inputs of the sample window.
+/// - `nodes`: Location of every bin of the bandpass in the frequency nodes of the beams.
 /// - `tile`: Indices of the sources of the tile.
-/// - `fields`: Fields of the sources of the tile, per source real parts followed by
-///   imaginary parts.
+/// - `fields`: Fields of the sources of the tile, per source and bin of the bandpass.
 fn receive_sources(
     spectra: &mut [f32],
     first_antenna: usize,
     window: &Window,
-    tile: Range<usize>,
-    fields: &[f32],
+    nodes: &[(usize, f64)],
+    tile: std::ops::Range<usize>,
+    fields: &[Field],
 ) {
-    let num_band_bins = window.bandpass_bins().count();
+    let num_band_bins = nodes.len();
+    let response = &window.response;
     let bin_width = window.sample_frequency / window.spectrum_size as f64;
     let first_frequency = window.frequency(*window.bandpass_bins().start());
+
+    // the groups of the antennas, each with a slot for the received field of a source
     let antennas = first_antenna..first_antenna + spectra.len() / (2 * num_band_bins);
+    let mut groups: Vec<usize> = antennas
+        .clone()
+        .map(|a| response.antenna_groups[a] as usize)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    let slots: Vec<usize> = antennas
+        .clone()
+        .map(|a| {
+            groups
+                .binary_search(&(response.antenna_groups[a] as usize))
+                .unwrap()
+        })
+        .collect();
+    // real parts followed by imaginary parts
+    let mut received = vec![0.0; groups.len() * 2 * CHUNK];
 
     for start in (0..num_band_bins).step_by(CHUNK) {
         let bins = start..(start + CHUNK).min(num_band_bins);
         let frequency = first_frequency + start as f64 * bin_width;
-        for (s, field) in tile.clone().zip(fields.chunks(2 * num_band_bins)) {
+        for (s, fields) in tile.clone().zip(fields.chunks(num_band_bins)) {
             let direction = window.sources[s].direction;
-            let (field_re, field_im) = field.split_at(num_band_bins);
-            for (antenna, spectrum) in antennas.clone().zip(spectra.chunks_mut(2 * num_band_bins)) {
+            for (&group, received) in groups.iter().zip(received.chunks_mut(2 * CHUNK)) {
+                let scalar = response.is_scalar(group);
+                let (re, im) = received.split_at_mut(CHUNK);
+                for (((re, im), field), &node) in re
+                    .iter_mut()
+                    .zip(im)
+                    .zip(&fields[bins.clone()])
+                    .zip(&nodes[bins.clone()])
+                {
+                    let [j_north, j_east] = window.sky.jones_at(s, group, node);
+                    let value = if scalar {
+                        field.scalar * j_north.re
+                    } else {
+                        j_north * field.north + j_east * field.east
+                    };
+                    (*re, *im) = (value.re, value.im);
+                }
+            }
+            for ((antenna, spectrum), &slot) in antennas
+                .clone()
+                .zip(spectra.chunks_mut(2 * num_band_bins))
+                .zip(&slots)
+            {
                 let (re, im) = spectrum.split_at_mut(num_band_bins);
+                let received = &received[slot * 2 * CHUNK..(slot + 1) * 2 * CHUNK];
                 let delay = direction.dot(window.antenna_positions[antenna]) / C;
                 add_delayed(
                     &mut re[bins.clone()],
                     &mut im[bins.clone()],
-                    &field_re[bins.clone()],
-                    &field_im[bins.clone()],
+                    &received[..bins.len()],
+                    &received[CHUNK..CHUNK + bins.len()],
                     frequency,
                     bin_width,
                     delay,
@@ -305,7 +392,7 @@ fn receive_sources(
     }
 }
 
-/// Adds a spectrum delayed by `delay` (s): `spectrum[k] += field[k] e^{i 2π f_k delay}`,
+/// Adds a spectrum delayed by `delay` (s): `spectrum[k] += received[k] e^{i 2π f_k delay}`,
 /// with `f_k = first_frequency + k bin_width`, for spectra given as real and imaginary parts.
 ///
 /// The phasor is advanced from bin to bin by multiplication, in `LANES` interleaved
@@ -318,8 +405,8 @@ fn receive_sources(
 fn add_delayed(
     spectrum_re: &mut [f32],
     spectrum_im: &mut [f32],
-    field_re: &[f32],
-    field_im: &[f32],
+    received_re: &[f32],
+    received_im: &[f32],
     first_frequency: f64,
     bin_width: f64,
     delay: f64,
@@ -337,16 +424,16 @@ fn add_delayed(
 
     let (spectrum_re, spectrum_re_rest) = spectrum_re.as_chunks_mut::<LANES>();
     let (spectrum_im, spectrum_im_rest) = spectrum_im.as_chunks_mut::<LANES>();
-    let (field_re, field_re_rest) = field_re.as_chunks::<LANES>();
-    let (field_im, field_im_rest) = field_im.as_chunks::<LANES>();
-    for (((spectrum_re, spectrum_im), field_re), field_im) in spectrum_re
+    let (received_re, received_re_rest) = received_re.as_chunks::<LANES>();
+    let (received_im, received_im_rest) = received_im.as_chunks::<LANES>();
+    for (((spectrum_re, spectrum_im), received_re), received_im) in spectrum_re
         .iter_mut()
         .zip(spectrum_im)
-        .zip(field_re)
-        .zip(field_im)
+        .zip(received_re)
+        .zip(received_im)
     {
         for lane in 0..LANES {
-            let (a, b) = (field_re[lane], field_im[lane]);
+            let (a, b) = (received_re[lane], received_im[lane]);
             let (p, q) = (phasor_re[lane], phasor_im[lane]);
             spectrum_re[lane] += a * p - b * q;
             spectrum_im[lane] += a * q + b * p;
@@ -355,7 +442,7 @@ fn add_delayed(
         }
     }
     for lane in 0..spectrum_re_rest.len() {
-        let (a, b) = (field_re_rest[lane], field_im_rest[lane]);
+        let (a, b) = (received_re_rest[lane], received_im_rest[lane]);
         let (p, q) = (phasor_re[lane], phasor_im[lane]);
         spectrum_re_rest[lane] += a * p - b * q;
         spectrum_im_rest[lane] += a * q + b * p;
@@ -405,8 +492,8 @@ fn simulate_sample_window(antenna: usize, window: &Window, sources: &[f32]) -> V
 /// Adds the receiver system noise contribution to a synthesized spectrum.
 ///
 /// Noise is generated independently for each frequency bin within the
-/// configured bandpass. The effective aperture area is approximated as
-/// λ²/4 and capped at 4 m².
+/// configured bandpass, with the amplitude of `k_B T_sys` received with the reference
+/// area of the array.
 ///
 /// # Arguments
 ///
@@ -419,10 +506,9 @@ fn simulate_spectrum_system_noise_contribution(
     antenna_system_noise_phases: &[f32],
 ) {
     for (index, &phase) in window.bandpass_bins().zip(antenna_system_noise_phases) {
-        let lambda = C / window.frequency(index);
-        let effective_aperture = (lambda * lambda / 4.0).min(4.0);
-        let amplitude = (window.system_noise_intensity / effective_aperture).sqrt();
-        spectrum[index] += to_f32(Complex64::from_polar(amplitude, phase as f64));
+        let amplitude = window.response.noise_amplitudes[index];
+        let phase = phase as f64;
+        spectrum[index] += to_f32(Complex64::from_polar(amplitude, phase));
     }
 }
 
@@ -430,7 +516,8 @@ fn simulate_spectrum_system_noise_contribution(
 ///
 /// The calibrator signals are evaluated in the time domain, transformed to the
 /// frequency domain and added within the bandpass, so that they are filtered
-/// exactly like the sky.
+/// exactly like the sky. If their link responses depend on frequency, the signal of
+/// every calibrator is transformed separately and filtered by its link response.
 ///
 /// # Arguments
 ///
@@ -444,12 +531,23 @@ fn simulate_spectrum_calibrator_contributions(
     window: &Window,
     calibrators: &CalibratorWindow,
 ) {
-    // The antenna gain does not depend on frequency, so all calibrators can share one FFT.
-    let mut signal = calibrators.antenna_signal(antenna);
-    window.calibrator_fft.process(&mut signal);
     // undo the scaling of the inverse FFT and the normalization of the output samples
     let scale = (spectrum.len() as f64).sqrt().recip();
-    for index in window.bandpass_bins() {
-        spectrum[index] += to_f32(signal[index] * scale);
+    if calibrators.flat {
+        // the link responses do not depend on frequency, so all calibrators can share one FFT
+        let mut signal = calibrators.antenna_signal(antenna);
+        window.calibrator_fft.process(&mut signal);
+        for index in window.bandpass_bins() {
+            spectrum[index] += to_f32(signal[index] * scale);
+        }
+        return;
+    }
+    for calibrator in 0..calibrators.calibrators.len() {
+        let mut signal = calibrators.calibrator_signal(antenna, calibrator);
+        window.calibrator_fft.process(&mut signal);
+        for index in window.bandpass_bins() {
+            let link = calibrators.link(calibrator, antenna, window.frequency(index));
+            spectrum[index] += to_f32(signal[index] * link * scale);
+        }
     }
 }

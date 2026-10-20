@@ -1,5 +1,7 @@
 const LIGHT_SPEED: f32 = 299.792458; // light speed in megameters/s
 const TAU: f32 = 6.283185307179586;
+// set in the group of receivers whose beam has no polarization
+const SCALAR_GROUP: u32 = 0x80000000u;
 // number of consecutive bins of the bandpass evaluated by one invocation, written out in main
 const BLOCK: u32 = 16u;
 
@@ -7,7 +9,8 @@ struct Receiver {
     x: f32,
     y: f32,
     z: f32,
-    _p: u32,
+    // index of the receiver group, with SCALAR_GROUP set for beams without polarization
+    group: u32,
 };
 
 struct Source {
@@ -17,6 +20,10 @@ struct Source {
     a1: f32,
     a2: f32,
     a3: f32,
+    pol_frac: f32,
+    pol_angle: f32,
+    circ_frac: f32,
+    rm: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -31,13 +38,19 @@ struct Params {
     num_bins: u32,
     sources_tile_size: u32,
     num_receivers: u32,
-    receiver_noise_i: f32,
+    num_groups: u32,
+    // frequency nodes of the beam table
+    beam_f0_mhz: f32,
+    beam_df_mhz: f32,
+    beam_nodes: u32,
+    // number of random phases per source and bin
+    polarizations: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> receivers: array<Receiver>;
 @group(0) @binding(2) var<storage, read> sources: array<Source>;
-// field per source and bin of the bandpass, without the geometric delay
+// received field per source, group and bin of the bandpass, without the geometric delay
 @group(0) @binding(3) var<storage, read> fields: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> spectrum: array<vec2<f32>>;
 
@@ -61,8 +74,8 @@ fn fft_bin_frequency(bin: u32) -> f32 {
 // Adds the fields of the sources of a tile, delayed geometrically, to a block of BLOCK
 // consecutive bins of a receiver's spectrum.
 //
-// The invocations of a workgroup evaluate the same bins of different receivers, which read
-// the same fields. The geometric phase is advanced from bin to bin by a rotation. The
+// The invocations of a workgroup evaluate the same bins of different receivers, which mostly
+// read the same fields. The geometric phase is advanced from bin to bin by a rotation. The
 // block is written out without loops, so that the fields of a source are loaded together.
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -74,6 +87,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let rx = receivers[receiver_idx];
+    let group = rx.group & ~SCALAR_GROUP;
     let position = vec3<f32>(rx.x, rx.y, rx.z);
     let count = min(BLOCK, params.band_len - first);
     let idx = receiver_idx * params.num_bins + params.band_start + first;
@@ -85,7 +99,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let first_freq = fft_bin_frequency(params.band_start + first) + params.downmix_freq_mhz;
     let bin_width = params.sample_freq_mhz / f32(params.num_bins);
-    // the fields of a source are padded to a multiple of BLOCK bins
+    // the fields of a source and group are padded to a multiple of BLOCK bins
     let stride = (params.band_len + BLOCK - 1u) / BLOCK * (BLOCK / 2u);
 
     for (var s = 0u; s < params.sources_tile_size; s++) {
@@ -95,7 +109,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let step_phase = TAU * fract(bin_width * delay);
         let step = vec2<f32>(cos(step_phase), sin(step_phase));
 
-        let base = s * stride + first / 2u;
+        let base = (s * params.num_groups + group) * stride + first / 2u;
         let f0 = fields[base];
         let f1 = fields[base + 1u];
         let f2 = fields[base + 2u];

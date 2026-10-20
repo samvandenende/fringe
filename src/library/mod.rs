@@ -1,18 +1,26 @@
 use std::sync::Arc;
 
+pub use beam::{Attitude, Beam, Orientation};
+pub use beam_io::{load_beam, save_beam};
 use calibrator::{CalibratorWindow, ConditionedBuffer};
+pub use error::Error;
 pub use model::*;
 use num_complex::Complex32;
 use numpy::{PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use response::{ArrayResponse, SkyTable};
 pub use utils::*;
 
+mod beam;
+mod beam_io;
 mod calibrator;
 mod cpu;
+mod error;
 mod gpu;
 mod model;
+mod response;
 mod utils;
 
 pub const DEFAULT_FREQUENCY_RESOLUTION: usize = 4;
@@ -23,7 +31,9 @@ pub struct Simulation {
     rng: ChaCha8Rng,
     runtime: Runtime,
     array: Array,
+    response: Arc<ArrayResponse>,
     sources: Vec<Source>,
+    sky: Arc<SkyTable>,
     calibrators: Vec<Calibrator>,
     conditioned_buffers: Vec<Arc<ConditionedBuffer>>,
     random_phases: Option<Phases>,
@@ -56,7 +66,12 @@ impl Simulation {
             "frequency resolution must be a power of 2"
         );
 
-        let runtime = Runtime::new(&runtime, &array, frequency_resolution);
+        let response = Arc::new(ArrayResponse::new(
+            &array,
+            array.sample_window_size * frequency_resolution,
+        ));
+        let sky = Arc::new(SkyTable::new(&response, &[]));
+        let runtime = Runtime::new(&runtime, &array, &response, frequency_resolution);
 
         let seed = rng_seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
@@ -69,7 +84,9 @@ impl Simulation {
             rng,
             runtime,
             array,
+            response,
             sources: Vec::new(),
+            sky,
             calibrators: Vec::new(),
             conditioned_buffers: Vec::new(),
             random_phases: None,
@@ -82,9 +99,13 @@ impl Simulation {
     ///
     /// These sources will be used on the next call to `Simulation::start`
     ///
+    /// The response of every receiver to every source is tabulated here, so calling this
+    /// takes a while for large sky models with tabulated beams.
+    ///
     /// # Arguments
     /// - `sources`: List of `Source` objects defining the sky model.
     pub fn set_sources(&mut self, sources: Vec<Source>) {
+        self.sky = Arc::new(SkyTable::new(&self.response, &sources));
         self.sources = sources;
     }
 
@@ -139,6 +160,7 @@ impl Simulation {
         let calibrators = (!self.calibrators.is_empty()).then(|| {
             Arc::new(CalibratorWindow::new(
                 &self.array,
+                &self.response,
                 &self.calibrators,
                 &self.conditioned_buffers,
                 self.array.sample_window_size * self.frequency_resolution,
@@ -159,12 +181,15 @@ impl Simulation {
                 &self.array,
                 self.sources.len(),
                 self.frequency_resolution,
+                self.response.source_polarizations(),
             ));
         }
 
         self.runtime.start(
             &self.array,
+            &self.response,
             &self.sources,
+            &self.sky,
             calibrators.as_ref(),
             self.random_phases.as_ref().unwrap(),
         )
@@ -176,7 +201,8 @@ impl Simulation {
     ///
     /// # Returns
     /// A 2D array of single precision complex-valued antenna samples, of shape
-    /// (antennas, samples).
+    /// (antennas, samples). Cast it to `np.complex128` if computations on it need double
+    /// precision.
     #[pyo3(name = "finish")]
     fn finish_array<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<Complex32>> {
         let samples = self.finish();
@@ -219,14 +245,24 @@ impl Runtime {
     /// # Arguments
     /// - `runtime`: The desired runtime, can be either `"cpu"` or `"gpu"`.
     /// - `array`: Antenna array configuration used to size internal resources.
+    /// - `response`: Receive response of the array.
     /// - `frequency_resolution`: Number of frequency bins used per sample window.
     ///
     /// # Returns
     /// A newly initialized `Runtime`.
-    fn new(runtime: &str, array: &Array, frequency_resolution: usize) -> Self {
+    fn new(
+        runtime: &str,
+        array: &Array,
+        response: &ArrayResponse,
+        frequency_resolution: usize,
+    ) -> Self {
         match runtime.trim().to_lowercase().as_str() {
             "cpu" => Runtime::Cpu(Box::new(cpu::Runtime::new(frequency_resolution))),
-            "gpu" => Runtime::Gpu(Box::new(gpu::Runtime::new(array, frequency_resolution))),
+            "gpu" => Runtime::Gpu(Box::new(gpu::Runtime::new(
+                array,
+                response,
+                frequency_resolution,
+            ))),
             _ => panic!("Runtime must be one of [cpu, gpu]"),
         }
     }
@@ -235,19 +271,27 @@ impl Runtime {
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration (positions, sampling parameters, etc.).
+    /// - `response`: Receive response of the array.
     /// - `sources`: List of signal sources contributing to the simulation.
+    /// - `sky`: Response of the receivers to the sources.
     /// - `calibrators`: Precomputed calibrator signals, if there are any calibrators.
     /// - `phases`: Precomputed phase information for system noise and sources.
     fn start(
         &mut self,
         array: &Array,
+        response: &Arc<ArrayResponse>,
         sources: &[Source],
+        sky: &Arc<SkyTable>,
         calibrators: Option<&Arc<CalibratorWindow>>,
         phases: &Phases,
     ) {
         match self {
-            Runtime::Cpu(runtime) => runtime.start(array, sources, calibrators, phases),
-            Runtime::Gpu(runtime) => runtime.start(array, sources, calibrators, phases),
+            Runtime::Cpu(runtime) => {
+                runtime.start(array, response, sources, sky, calibrators, phases)
+            }
+            Runtime::Gpu(runtime) => {
+                runtime.start(array, response, sources, sky, calibrators, phases)
+            }
         }
     }
 

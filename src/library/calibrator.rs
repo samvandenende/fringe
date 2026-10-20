@@ -3,7 +3,10 @@ use std::{f64::consts::TAU, sync::Arc};
 use num_complex::{Complex32, Complex64};
 use rustfft::FftPlanner;
 
-use super::{Array, Calibrator, Transmitter, Vec3};
+use super::{
+    Array, Calibrator, Transmitter, Vec3,
+    response::{ArrayResponse, FrequencyNodes, link_nodes},
+};
 
 /// Speed of light in vacuum (m/s).
 const C: f64 = 299792458.0;
@@ -237,8 +240,9 @@ pub(crate) struct Segment {
     pub(crate) buffer_frac: f64,
     /// Carrier phase delay `f_c * τ0` in cycles, in `[0, 1)`.
     pub(crate) carrier: f64,
-    /// Received amplitude, including the antenna gain.
-    pub(crate) amplitude: f64,
+    /// Received complex amplitude, including the link response if it does not depend on
+    /// frequency.
+    pub(crate) amplitude: Complex64,
     /// Cubic polynomial `τ(x) - τ0` (s) in the normalized segment coordinate `x ∈ [-1, 1]`.
     pub(crate) delay: [f64; 4],
 }
@@ -258,6 +262,12 @@ pub(crate) struct Segment {
 /// Sample `m` of the synthesis window is received at
 /// `start_time + (m - offset) / sample_frequency`, such that the first output sample
 /// is received at `start_time`.
+///
+/// The beams of the receivers and transmitters, and the polarization mismatch between
+/// them, form the link response of every antenna-calibrator pair. It is evaluated for the
+/// geometry at the middle of the window. If it does not depend on frequency it is part of
+/// the segment amplitudes (`flat`), otherwise the runtimes filter the signal of every
+/// calibrator separately by its link response, tabulated at `nodes`.
 pub(crate) struct CalibratorWindow {
     pub(crate) num_bins: usize,
     /// Number of samples before the first output sample.
@@ -269,6 +279,13 @@ pub(crate) struct CalibratorWindow {
     pub(crate) common: Vec<CommonSample>,
     /// Indexed by `(antenna * num_calibrators + calibrator) * num_segments + segment`.
     pub(crate) segments: Vec<Segment>,
+    /// Whether the link responses are part of the segment amplitudes.
+    pub(crate) flat: bool,
+    pub(crate) nodes: FrequencyNodes,
+    /// Link responses, indexed by `(calibrator * num_antennas + antenna) * nodes.count + node`.
+    /// Empty if `flat`.
+    pub(crate) links: Vec<Complex64>,
+    pub(crate) num_antennas: usize,
 }
 
 impl CalibratorWindow {
@@ -276,6 +293,7 @@ impl CalibratorWindow {
     ///
     /// # Arguments
     /// - `array`: Antenna array configuration.
+    /// - `response`: Receive response of the array.
     /// - `calibrators`: Calibrators to simulate.
     /// - `buffers`: Conditioned buffers of the calibrators' transmitters.
     /// - `num_bins`: Number of samples in the synthesis window.
@@ -288,6 +306,7 @@ impl CalibratorWindow {
     /// Panics if a calibrator coincides with an antenna.
     pub(crate) fn new(
         array: &Array,
+        response: &ArrayResponse,
         calibrators: &[Calibrator],
         buffers: &[Arc<ConditionedBuffer>],
         num_bins: usize,
@@ -331,12 +350,40 @@ impl CalibratorWindow {
             }));
         }
 
-        let mut segments =
-            Vec::with_capacity(array.antenna_positions.len() * calibrators.len() * num_segments);
-        for &antenna in &array.antenna_positions {
-            for (calibrator, signal) in calibrators.iter().zip(&signals) {
+        // link responses, for the geometry at the middle of the window
+        let num_antennas = array.antenna_positions.len();
+        let nodes = link_nodes(array, response, calibrators.iter().map(|c| &c.transmitter));
+        let flat = nodes.count == 1;
+        let middle = start_time + sample_time((num_bins - 1) as f64 / 2.0);
+        let mut links = Vec::with_capacity(calibrators.len() * num_antennas * nodes.count);
+        for calibrator in calibrators {
+            for (a, &antenna) in array.antenna_positions.iter().enumerate() {
+                let delay = light_time(calibrator, antenna, middle);
+                let position = calibrator.position_at(middle - delay);
+                let direction = (position - antenna).normalized();
+                let attitude = calibrator.attitude.orientation_at(position);
+                links.extend((0..nodes.count).map(|k| {
+                    response.link(
+                        a,
+                        &calibrator.transmitter,
+                        attitude,
+                        direction,
+                        nodes.frequency(k),
+                    )
+                }));
+            }
+        }
+
+        let mut segments = Vec::with_capacity(num_antennas * calibrators.len() * num_segments);
+        for (a, &antenna) in array.antenna_positions.iter().enumerate() {
+            for (c, (calibrator, signal)) in calibrators.iter().zip(&signals).enumerate() {
                 let len = signal.buffer.samples.len() as f64;
                 let transmitter = &calibrator.transmitter;
+                let link = if flat {
+                    links[c * num_antennas + a]
+                } else {
+                    Complex64::ONE
+                };
                 for segment in 0..num_segments {
                     let center = segment_center(segment, segment_len);
                     let time = start_time + sample_time(center);
@@ -347,13 +394,10 @@ impl CalibratorWindow {
                         segment_half_len / sample_frequency,
                     );
 
-                    let direction = calibrator.position_at(time - delay0) - antenna;
-                    let distance = direction.norm();
+                    let distance = (calibrator.position_at(time - delay0) - antenna).norm();
                     assert!(distance > 0.0, "calibrator coincides with an antenna");
-                    let direction_z = direction.z / distance;
-                    let gain = direction_z * direction_z;
-                    let amplitude =
-                        received_amplitude(gain, transmitter.power, distance, sample_frequency);
+                    let amplitude = link
+                        * received_amplitude(1.0, transmitter.power, distance, sample_frequency);
 
                     let (buffer_index, buffer_frac) = split(delay0 * signal.oversampled_rate, len);
                     let (_, carrier) = split(signal.frequency * delay0, 1.0);
@@ -376,6 +420,10 @@ impl CalibratorWindow {
             calibrators: signals,
             common,
             segments,
+            flat,
+            nodes,
+            links: if flat { Vec::new() } else { links },
+            num_antennas,
         }
     }
 
@@ -387,8 +435,21 @@ impl CalibratorWindow {
     /// # Returns
     /// The signal summed over all calibrators and tapered by `taper`.
     pub(crate) fn antenna_signal(&self, antenna: usize) -> Vec<Complex64> {
+        self.signal(antenna, 0..self.calibrators.len())
+    }
+
+    /// Evaluates the signal of one calibrator received by an antenna over the synthesis
+    /// window, without its link response if that depends on frequency.
+    ///
+    /// # Returns
+    /// The signal tapered by `taper`.
+    pub(crate) fn calibrator_signal(&self, antenna: usize, calibrator: usize) -> Vec<Complex64> {
+        self.signal(antenna, calibrator..calibrator + 1)
+    }
+
+    fn signal(&self, antenna: usize, calibrators: std::ops::Range<usize>) -> Vec<Complex64> {
         let mut signal = vec![Complex64::ZERO; self.num_bins];
-        for calibrator in 0..self.calibrators.len() {
+        for calibrator in calibrators {
             for (m, value) in signal.iter_mut().enumerate() {
                 *value += self.sample(antenna, calibrator, m);
             }
@@ -397,6 +458,14 @@ impl CalibratorWindow {
             *value *= taper(m, self.offset, self.num_bins);
         }
         signal
+    }
+
+    /// Link response of an antenna-calibrator pair at a physical frequency (Hz), for a
+    /// window whose link responses depend on frequency.
+    pub(crate) fn link(&self, calibrator: usize, antenna: usize, frequency: f64) -> Complex64 {
+        let base = (calibrator * self.num_antennas + antenna) * self.nodes.count;
+        self.nodes
+            .interpolate(&self.links[base..base + self.nodes.count], frequency)
     }
 
     /// Evaluates a sample of a calibrator signal as received by an antenna.
@@ -429,7 +498,7 @@ impl CalibratorWindow {
         let value = signal.buffer.interpolate(position);
 
         let phase = common.carrier - segment.carrier - signal.frequency * delay;
-        value * Complex64::from_polar(segment.amplitude, TAU * phase)
+        value * segment.amplitude * Complex64::from_polar(1.0, TAU * phase)
     }
 }
 
@@ -437,11 +506,11 @@ impl CalibratorWindow {
 ///
 /// The received power flux density `G * P / (4π d²)` (W/m²) is expressed in the units of
 /// the sky model: spread over the sample frequency of the array and converted to Jy. A
-/// calibrator that is white over the sample frequency is therefore received like a sky
-/// source of the same flux density.
+/// calibrator that is white over the sample frequency is therefore received like a fully
+/// polarized sky source of the same flux density.
 ///
 /// # Arguments
-/// - `gain`: Antenna gain in the direction of the calibrator.
+/// - `gain`: Gain of the link, 1 for an isotropic transmitter received with the reference area.
 /// - `power`: Equivalent isotropically radiated power of the transmitter (W).
 /// - `distance`: Distance between the calibrator and the antenna (m).
 /// - `sample_frequency`: Sample frequency of the array (Hz).
@@ -567,8 +636,12 @@ mod tests {
             downmix_frequency: DOWNMIX_FREQUENCY,
             bandpass: [5e6, 55e6],
             sample_window_size,
-            system_noise_intensity: 0.0,
+            system_noise_temperature: crate::library::model::NoiseTemperature::Constant(0.0),
             antenna_positions,
+            beams: vec![crate::library::Beam::cos_squared()],
+            antenna_beams: Vec::new(),
+            antenna_orientations: Vec::new(),
+            horizon: None,
         }
     }
 
@@ -601,11 +674,11 @@ mod tests {
 
     /// Transmitter of a single tone at `frequency`.
     fn tone(frequency: f64, power: f64) -> Transmitter {
-        Transmitter::new(frequency, 1e6, power, vec![Complex32::ONE], None, 0.0)
+        Transmitter::new(frequency, 1e6, power, vec![Complex32::ONE], None, 0.0, None)
     }
 
     fn static_calibrator(position: Vec3, transmitter: Transmitter) -> Calibrator {
-        Calibrator::new(position, transmitter, None, None, 0.0)
+        Calibrator::new(position, transmitter, None, None, 0.0, None)
     }
 
     fn power(samples: &[Complex64]) -> f64 {
@@ -644,6 +717,7 @@ mod tests {
             Some(Vec3::new(v, 0.0, 0.0)),
             None,
             0.0,
+            None,
         );
         let delay = light_time(&calibrator, Vec3::default(), t);
         assert!((delay - (x0 + v * t) / (C + v)).abs() < 1e-18);
@@ -658,6 +732,7 @@ mod tests {
             Some(Vec3::new(1600.0, 200.0, -100.0)),
             Some(Vec3::new(-2.0, 0.5, -25.6)),
             0.0,
+            None,
         );
         let receiver = Vec3::new(50.0, -30.0, 1.0);
         // segments of 4096 samples at 120 MHz and at 1 MHz
@@ -691,7 +766,7 @@ mod tests {
         let expected =
             wrap(TAU * (baseband_frequency + DOWNMIX_FREQUENCY) * direction.dot(baseline) / C);
 
-        let source = Source::new(direction, 75e6, 1.0, 0.0, 0.0, 0.0);
+        let source = Source::new(direction, 75e6, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let samples = simulate(&array, vec![source], vec![], 4, 0.0);
         let spectra = samples
             .into_iter()
@@ -731,6 +806,7 @@ mod tests {
             Some(Vec3::new(0.0, 0.0, velocity)),
             None,
             0.0,
+            None,
         );
         let samples = &simulate(&array, vec![], vec![calibrator], 4, 0.0)[0];
         let phase_step = samples
@@ -785,6 +861,7 @@ mod tests {
             buffer.clone(),
             None,
             start_time,
+            None,
         );
         let calibrator = Calibrator::new(
             Vec3::new(2e4, -1e4, 9e4),
@@ -792,6 +869,7 @@ mod tests {
             Some(Vec3::new(1200.0, -800.0, 300.0)),
             Some(Vec3::new(3.0, 1.0, -20.0)),
             0.0,
+            None,
         );
         let antenna = Vec3::new(40.0, -25.0, 1.0);
         let array = test_array(vec![antenna], 1024);
@@ -846,6 +924,7 @@ mod tests {
                 .collect(),
             Some(16e6),
             0.0,
+            None,
         );
         let calibrator = Calibrator::new(
             Vec3::new(1e4, 2e4, 8e4),
@@ -853,6 +932,7 @@ mod tests {
             Some(Vec3::new(-900.0, 1300.0, 50.0)),
             Some(Vec3::new(0.0, 0.0, -25.0)),
             0.0,
+            None,
         );
         let antenna = Vec3::new(12.0, 7.0, 0.0);
         let time = 1.25;
@@ -874,8 +954,10 @@ mod tests {
     }
 
     /// A calibrator that is white over the receiver sample rate is received with the same
-    /// power as a sky source with the same flux density, `G * P / (4π d²)` spread over the
-    /// sample frequency, regardless of the scale of its buffer.
+    /// power as a fully polarized sky source with the same flux density, `G * P / (4π d²)`
+    /// spread over the sample frequency, regardless of the scale of its buffer. A receiver
+    /// without polarization receives half of an unpolarized source, so that is an
+    /// unpolarized source of twice the flux density.
     #[test]
     fn white_buffer_matches_source() {
         let sample_window_size = 4096;
@@ -900,17 +982,108 @@ mod tests {
             buffer,
             None,
             0.0,
+            None,
         );
         let array = test_array(vec![Vec3::default()], sample_window_size);
         let calibrator = static_calibrator(Vec3::new(0.0, 0.0, distance), transmitter);
         // one bin per output sample, so the buffer is periodic over the synthesis window
         let measured = power(&simulate(&array, vec![], vec![calibrator], 1, 0.0)[0]);
 
-        let flux_density = power_w / (2.0 * TAU * distance * distance) / SAMPLE_FREQUENCY / JANSKY;
-        let source = Source::new(Vec3::new(0.0, 0.0, 1.0), 75e6, flux_density, 0.0, 0.0, 0.0);
+        let flux_density =
+            2.0 * power_w / (2.0 * TAU * distance * distance) / SAMPLE_FREQUENCY / JANSKY;
+        let source = Source::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            75e6,
+            flux_density,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
         let expected = power(&simulate(&array, vec![source], vec![], 1, 0.0)[0]);
         println!("power ratio {}", measured / expected);
         assert!((measured / expected - 1.0).abs() < 1e-3);
+    }
+
+    /// A link between two short dipoles: polarization matched they receive the directivity
+    /// of the transmitting dipole, crossed nothing, and a dipole tilted by 60° a quarter.
+    #[test]
+    fn dipole_link_follows_friis_and_polarization() {
+        use crate::library::{Attitude, Beam, Orientation};
+        let sample_window_size = 4096;
+        let position = Vec3::new(0.0, 0.0, 1e5);
+        let carrier = DOWNMIX_FREQUENCY + 20e6;
+        let mut transmitter = tone(carrier, 1.0);
+        transmitter.beam = Some(Beam::short_dipole());
+        // the transmitter looks down, with its dipole along +x
+        let calibrator = Calibrator::new(
+            position,
+            transmitter,
+            None,
+            None,
+            0.0,
+            Some(Attitude::point_at(
+                Vec3::default(),
+                Vec3::new(1.0, 0.0, 0.0),
+            )),
+        );
+        let isotropic = received_amplitude(1.0, 1.0, position.norm(), SAMPLE_FREQUENCY).powi(2);
+        let received_power = |orientation: Orientation| {
+            let array = Array {
+                beams: vec![Beam::short_dipole()],
+                antenna_orientations: vec![orientation],
+                ..test_array(vec![Vec3::default()], sample_window_size)
+            };
+            power(&simulate(&array, vec![], vec![calibrator.clone()], 4, 0.0)[0]) / isotropic
+        };
+        let matched = received_power(Orientation::identity());
+        let crossed = received_power(Orientation::identity().rotated(TAU / 4.0));
+        let tilted = received_power(Orientation::identity().rotated(TAU / 6.0));
+        println!("matched {matched}, crossed {crossed:e}, tilted {tilted}");
+        assert!((matched - 1.5).abs() < 1e-3);
+        assert!(crossed < 1e-9);
+        assert!((tilted - 1.5 * 0.25).abs() < 1e-3);
+    }
+
+    /// A transmitter whose boresight tracks the antenna is received at its peak gain
+    /// wherever it is, one with a fixed attitude only where it points.
+    #[test]
+    fn point_at_attitude_tracks_target() {
+        use crate::library::{Attitude, Beam};
+        let beam = crate::library::beam::tests::tabulate(
+            &Beam::short_dipole(),
+            &[DOWNMIX_FREQUENCY, DOWNMIX_FREQUENCY + 60e6],
+            2.0,
+            2.0,
+        );
+        let array = test_array(vec![Vec3::default()], 1024);
+        let carrier = DOWNMIX_FREQUENCY + 20e6;
+        let isotropic = |position: Vec3| {
+            received_amplitude(1.0, 1.0, position.norm(), SAMPLE_FREQUENCY).powi(2)
+        };
+        for position in [Vec3::new(0.0, 0.0, 1e5), Vec3::new(3e4, -4e4, 6e4)] {
+            let mut transmitter = tone(carrier, 1.0);
+            transmitter.beam = Some(beam.clone());
+            let calibrator = Calibrator::new(
+                position,
+                transmitter,
+                None,
+                None,
+                0.0,
+                Some(Attitude::point_at(
+                    Vec3::default(),
+                    Vec3::new(0.0, 1.0, 0.0),
+                )),
+            );
+            let measured = power(&simulate(&array, vec![], vec![calibrator], 4, 0.0)[0]);
+            // the receiver's cos² beam and the transmitter's peak directivity of 1.5
+            let gain = (position.z / position.norm()).powi(2) * 1.5;
+            println!("gain {}, expected {gain}", measured / isotropic(position));
+            assert!((measured / isotropic(position) / gain - 1.0).abs() < 1e-2);
+        }
     }
 
     /// Tones well within the bandpass are received in full and tones well outside it are
@@ -935,6 +1108,7 @@ mod tests {
                 Some(Vec3::new(0.0, 0.0, velocity)),
                 None,
                 0.0,
+                None,
             );
             power(&simulate(&array, vec![], vec![calibrator], frequency_resolution, 0.0)[0])
                 / amplitude2

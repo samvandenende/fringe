@@ -6,7 +6,7 @@
     45000000.0
   ],
   "sample_window_size": 4096,
-  "system_noise_intensity": 13806490.0,
+  "system_noise_temperature": 10000.0,
   "antenna_positions": [
     {
       "x": 0.0,

@@ -134,7 +134,7 @@ def show_results(samples_cpu, samples_gpu, fs=1.0, window="hann"):
 
 
 def test_system_noise(
-    system_noise_intensity=1.0,
+    system_noise_temperature=1000.0,
     sample_frequency=120e6,
     downmix_frequency=45e6,
     bandpass_fmin=5e6,
@@ -150,7 +150,7 @@ def test_system_noise(
         bandpass_fmin,
         bandpass_fmax,
         sample_window_size,
-        system_noise_intensity,
+        system_noise_temperature,
     )
 
     sim_cpu = fr.Simulation("cpu", array, frequency_resolution, 42)

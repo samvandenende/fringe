@@ -1,8 +1,10 @@
-use crate::{Array, Calibrator, Source, Transmitter};
+use crate::library::beam::{Attitude, AttitudeKind, Orientation};
+use crate::library::beam_io::{BeamSpec, BeamWriter};
+use crate::library::error::Error;
+use crate::library::model::{JY_M2_PER_KELVIN, NoiseTemperature};
+use crate::{Array, Beam, Calibrator, Source, Transmitter};
 use csv::{ReaderBuilder, WriterBuilder};
 use num_complex::Complex32;
-use pyo3::PyResult;
-use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -231,7 +233,8 @@ impl Div<f64> for Vec3 {
 ///
 /// This structure stores random phase offsets for:
 /// - system noise per antenna
-/// - per-source spectral phases
+/// - per-source spectral phases, with an independent phase per frequency bin for each
+///   polarization of the source's field that the array receives
 ///
 /// Only the bins within the bandpass have phases. Every phase is drawn from the position in
 /// the random stream it would have if all bins had one, so the phases of a seed do not depend
@@ -241,7 +244,9 @@ pub(crate) struct Phases {
     pub(crate) band: RangeInclusive<usize>,
     /// Indexed by `antenna * band_len + bin - band.start()`.
     pub(crate) system_noise: Arc<Vec<f32>>,
-    /// Indexed by `source * band_len + bin - band.start()`.
+    /// Number of phases per source and bin: 1 if no receiver has polarization, else 2.
+    pub(crate) polarizations: usize,
+    /// Indexed by `(source * band_len + bin - band.start()) * polarizations + polarization`.
     pub(crate) sources: Arc<Vec<f32>>,
 }
 
@@ -253,6 +258,7 @@ impl Phases {
     /// - `array`: Antenna array configuration (used for sizing)
     /// - `num_sources`: Number of signal sources in the simulation
     /// - `frequency_resolution`: FFT oversampling factor
+    /// - `polarizations`: Number of phases per source and bin
     ///
     /// # Returns
     /// Fully initialized phases
@@ -261,10 +267,12 @@ impl Phases {
         array: &Array,
         num_sources: usize,
         frequency_resolution: usize,
+        polarizations: usize,
     ) -> Self {
         let mut phases = Phases {
             band: 0..=0,
             system_noise: Arc::new(Vec::new()),
+            polarizations,
             sources: Arc::new(Vec::new()),
         };
 
@@ -303,6 +311,7 @@ impl Phases {
         self.band = bandpass_bins(array.bandpass, array.sample_frequency, num_spectrum_bins);
         let band_len = self.band_len();
         let first = *self.band.start();
+        let polarizations = self.polarizations;
         let num_antennas = array.antenna_positions.len();
 
         let start = rng.get_word_pos();
@@ -314,10 +323,14 @@ impl Phases {
             |antenna| start + (antenna * num_spectrum_bins + first) as u128,
         );
         let sources_start = start + (num_antennas * num_spectrum_bins) as u128;
-        fill_phases(&mut self.sources, rng, num_sources, band_len, |source| {
-            sources_start + (source * num_spectrum_bins + first) as u128
-        });
-        rng.set_word_pos(sources_start + (num_sources * num_spectrum_bins) as u128);
+        fill_phases(
+            &mut self.sources,
+            rng,
+            num_sources,
+            band_len * polarizations,
+            |source| sources_start + ((source * num_spectrum_bins + first) * polarizations) as u128,
+        );
+        rng.set_word_pos(sources_start + (num_sources * num_spectrum_bins * polarizations) as u128);
     }
 }
 
@@ -409,23 +422,61 @@ pub fn fft_bin_frequency(num_bins: usize, sample_freq: f64, bin: usize) -> f64 {
     }
 }
 
+/// Array file contents: the array with references to its beams.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArrayJson {
+    #[serde(flatten)]
+    array: Array,
+    /// Beams of the array, `[cos_squared]` if not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    beams: Option<Vec<BeamSpec>>,
+    /// Noise power spectral density `k_B * T` (Jy m²) of array files written before
+    /// noise temperatures, read in place of `system_noise_temperature`.
+    #[serde(default, skip_serializing)]
+    system_noise_intensity: Option<f64>,
+}
+
 /// Saves the array configuration to a file in JSON format.
+///
+/// Tabulated beams are written next to it in fringe's beam format, named
+/// `<file stem>.beam<index>.json`.
 ///
 /// # Arguments
 /// - `array`: The array.
 /// - `filepath`: Destination path where the array will be written.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be created or written
+/// Returns an `Error` (an `IOError` in Python) if a file cannot be created or written.
 #[pyfunction]
-pub fn save_array(array: &Array, filepath: &str) -> PyResult<()> {
+pub fn save_array(array: &Array, filepath: &str) -> Result<(), Error> {
+    let path = Path::new(filepath);
+    // arrays with the default beam are written as before beams were introduced
+    let default_beams = array.beams.len() == 1 && array.beams[0].same(&Beam::cos_squared());
+    let beams = if default_beams {
+        None
+    } else {
+        let mut writer = BeamWriter::new(path)?;
+        Some(
+            array
+                .beams
+                .iter()
+                .map(|beam| writer.spec(beam))
+                .collect::<Result<Vec<_>, Error>>()?,
+        )
+    };
+
     let file = std::fs::File::create(filepath)
-        .map_err(|e| PyIOError::new_err(format!("Failed to create file '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to create file '{}': {}", filepath, e)))?;
 
     let writer = std::io::BufWriter::new(file);
 
-    serde_json::to_writer_pretty(writer, array)
-        .map_err(|e| PyIOError::new_err(format!("Failed to serialize Array: {}", e)))?;
+    let json = ArrayJson {
+        array: array.clone(),
+        beams,
+        system_noise_intensity: None,
+    };
+    serde_json::to_writer_pretty(writer, &json)
+        .map_err(|e| Error::new(format!("Failed to serialize Array: {}", e)))?;
 
     Ok(())
 }
@@ -439,7 +490,7 @@ pub fn save_array(array: &Array, filepath: &str) -> PyResult<()> {
 /// A reconstructed `Array` instance.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be read or parsed.
+/// Returns an `Error` (an `IOError` in Python) if the file cannot be read or parsed.
 ///
 /// # Panics
 /// Panics if:
@@ -448,17 +499,39 @@ pub fn save_array(array: &Array, filepath: &str) -> PyResult<()> {
 /// - downmix_frequency is negative
 /// - bandpass bounds are invalid or exceed Nyquist limit
 /// - sample_window_size is not a power of two
-/// - system_noise_intensity is negative
+/// - system_noise_temperature is invalid, see `Array(...)`
+/// - the beams or their assignment to antennas are invalid
 #[pyfunction]
-pub fn load_array(filepath: &str) -> PyResult<Array> {
+pub fn load_array(filepath: &str) -> Result<Array, Error> {
+    let path = Path::new(filepath);
     let file = std::fs::File::open(filepath)
-        .map_err(|e| PyIOError::new_err(format!("Failed to open file '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to open file '{}': {}", filepath, e)))?;
 
     let reader = std::io::BufReader::new(file);
 
-    let array: Array = serde_json::from_reader(reader)
-        .map_err(|e| PyIOError::new_err(format!("Failed to deserialize Array: {}", e)))?;
+    let json: ArrayJson = serde_json::from_reader(reader)
+        .map_err(|e| Error::new(format!("Failed to deserialize Array: {}", e)))?;
 
+    let mut array = json.array;
+    if array.system_noise_temperature.is_missing() {
+        let intensity = json.system_noise_intensity.ok_or_else(|| {
+            Error::new(format!(
+                "Failed to deserialize Array: '{}' gives no system_noise_temperature",
+                filepath
+            ))
+        })?;
+        array.system_noise_temperature = NoiseTemperature::Constant(intensity / JY_M2_PER_KELVIN);
+    }
+    if let Some(beams) = json.beams {
+        let directory = path.parent().unwrap_or(Path::new(""));
+        array.beams = beams
+            .iter()
+            .map(|spec| spec.resolve(directory))
+            .collect::<Result<Vec<_>, Error>>()?;
+    }
+    if let Some(horizon) = &mut array.horizon {
+        *horizon = horizon.normalized();
+    }
     array.validate();
 
     Ok(array)
@@ -475,6 +548,14 @@ struct SourceCsv {
     spectral_index_2: f64,
     #[serde(default)]
     spectral_index_3: f64,
+    #[serde(default)]
+    polarization_fraction: f64,
+    #[serde(default)]
+    polarization_angle: f64,
+    #[serde(default)]
+    circular_fraction: f64,
+    #[serde(default)]
+    rotation_measure: f64,
 }
 
 impl From<Source> for SourceCsv {
@@ -488,6 +569,10 @@ impl From<Source> for SourceCsv {
             spectral_index: source.spectral_index,
             spectral_index_2: source.spectral_index_2,
             spectral_index_3: source.spectral_index_3,
+            polarization_fraction: source.polarization_fraction,
+            polarization_angle: source.polarization_angle,
+            circular_fraction: source.circular_fraction,
+            rotation_measure: source.rotation_measure,
         }
     }
 }
@@ -502,6 +587,10 @@ impl From<SourceCsv> for Source {
             source.spectral_index,
             source.spectral_index_2,
             source.spectral_index_3,
+            source.polarization_fraction,
+            source.polarization_angle,
+            source.circular_fraction,
+            source.rotation_measure,
         )
     }
 }
@@ -513,11 +602,11 @@ impl From<SourceCsv> for Source {
 /// - `filepath`: Destination path where the sources will be written.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be created or written
+/// Returns an `Error` (an `IOError` in Python) if the file cannot be created or written.
 #[pyfunction]
-pub fn save_sources(sources: Vec<Source>, filepath: &str) -> PyResult<()> {
+pub fn save_sources(sources: Vec<Source>, filepath: &str) -> Result<(), Error> {
     let file = std::fs::File::create(filepath)
-        .map_err(|e| PyIOError::new_err(format!("Failed to create '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to create '{}': {}", filepath, e)))?;
 
     let writer = std::io::BufWriter::new(file);
 
@@ -527,19 +616,21 @@ pub fn save_sources(sources: Vec<Source>, filepath: &str) -> PyResult<()> {
         let src_csv = SourceCsv::from(src);
         csv_writer
             .serialize(src_csv)
-            .map_err(|e| PyIOError::new_err(format!("CSV serialize error: {}", e)))?;
+            .map_err(|e| Error::new(format!("CSV serialize error: {}", e)))?;
     }
 
     csv_writer
         .flush()
-        .map_err(|e| PyIOError::new_err(format!("CSV flush error: {}", e)))?;
+        .map_err(|e| Error::new(format!("CSV flush error: {}", e)))?;
 
     Ok(())
 }
 
 /// Loads a list of sources from a CSV file.
 ///
-/// The `spectral_index_2` and `spectral_index_3` columns are optional and default to 0.
+/// The `spectral_index_2`, `spectral_index_3`, `polarization_fraction`,
+/// `polarization_angle`, `circular_fraction` and `rotation_measure` columns are optional
+/// and default to 0.
 ///
 /// # Arguments
 /// - `filepath`: Path to the file containing a serialized list of `Source`s.
@@ -548,17 +639,18 @@ pub fn save_sources(sources: Vec<Source>, filepath: &str) -> PyResult<()> {
 /// A reconstructed list of `Source`s.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be read or parsed.
+/// Returns an `Error` (an `IOError` in Python) if the file cannot be read or parsed.
 ///
 /// # Panics
 /// Panics if, for a `Source`:
 /// - reference_frequency is not positive
 /// - reference_intensity is negative
 /// - any spectral index is not finite
+/// - the polarization parameters are invalid
 #[pyfunction]
-pub fn load_sources(filepath: &str) -> PyResult<Vec<Source>> {
+pub fn load_sources(filepath: &str) -> Result<Vec<Source>, Error> {
     let file = std::fs::File::open(filepath)
-        .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to open '{}': {}", filepath, e)))?;
 
     let reader = std::io::BufReader::new(file);
     let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(reader);
@@ -566,7 +658,7 @@ pub fn load_sources(filepath: &str) -> PyResult<Vec<Source>> {
     let mut sources = Vec::new();
     for result in csv_reader.deserialize() {
         let src_csv: SourceCsv =
-            result.map_err(|e| PyIOError::new_err(format!("CSV deserialize error: {}", e)))?;
+            result.map_err(|e| Error::new(format!("CSV deserialize error: {}", e)))?;
         let src = Source::from(src_csv);
         sources.push(src);
     }
@@ -584,6 +676,9 @@ struct CalibratorJson {
     #[serde(default)]
     epoch: f64,
     transmitter: TransmitterJson,
+    /// Attitude, the identity orientation if not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attitude: Option<AttitudeJson>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -597,30 +692,68 @@ struct TransmitterJson {
     start_time: f64,
     /// Path of the buffer file, relative to the calibrators file.
     buffer: String,
+    /// Beam, isotropic if not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    beam: Option<BeamSpec>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AttitudeJson {
+    Fixed { boresight: Vec3, reference: Vec3 },
+    PointAt { target: Vec3, reference: Vec3 },
+}
+
+impl From<Attitude> for AttitudeJson {
+    fn from(attitude: Attitude) -> Self {
+        match attitude.kind {
+            AttitudeKind::Fixed(o) => AttitudeJson::Fixed {
+                boresight: o.boresight(),
+                reference: o.reference(),
+            },
+            AttitudeKind::PointAt { target, reference } => {
+                AttitudeJson::PointAt { target, reference }
+            }
+        }
+    }
+}
+
+impl From<AttitudeJson> for Attitude {
+    fn from(json: AttitudeJson) -> Self {
+        match json {
+            AttitudeJson::Fixed {
+                boresight,
+                reference,
+            } => Attitude::fixed(Orientation::new(boresight, reference)),
+            AttitudeJson::PointAt { target, reference } => Attitude::point_at(target, reference),
+        }
+    }
 }
 
 /// Saves a list of calibrators to a file in JSON format.
 ///
 /// The transmit buffers are written next to it as raw interleaved little-endian
 /// 32-bit float IQ files (`cf32_le`), named `<file stem>.<index>.cf32`.
-/// Calibrators sharing a buffer share a buffer file.
+/// Calibrators sharing a buffer share a buffer file. Tabulated transmitter beams are
+/// written next to it in fringe's beam format, named `<file stem>.beam<index>.json`.
 ///
 /// # Arguments
 /// - `calibrators`: The list of calibrators.
 /// - `filepath`: Destination path where the calibrators will be written.
 ///
 /// # Errors
-/// Returns a Python `IOError` if a file cannot be created or written
+/// Returns an `Error` (an `IOError` in Python) if a file cannot be created or written.
 #[pyfunction]
-pub fn save_calibrators(calibrators: Vec<Calibrator>, filepath: &str) -> PyResult<()> {
+pub fn save_calibrators(calibrators: Vec<Calibrator>, filepath: &str) -> Result<(), Error> {
     let path = Path::new(filepath);
     let directory = path.parent().unwrap_or(Path::new(""));
     let stem = path
         .file_stem()
-        .ok_or_else(|| PyIOError::new_err(format!("Invalid file path '{}'", filepath)))?
+        .ok_or_else(|| Error::new(format!("Invalid file path '{}'", filepath)))?
         .to_string_lossy();
 
     let mut buffer_files: Vec<(Arc<[Complex32]>, String)> = Vec::new();
+    let mut beam_writer = BeamWriter::new(path)?;
     let mut entries = Vec::with_capacity(calibrators.len());
     for calibrator in calibrators {
         let transmitter = &calibrator.transmitter;
@@ -648,17 +781,24 @@ pub fn save_calibrators(calibrators: Vec<Calibrator>, filepath: &str) -> PyResul
                 bandwidth: transmitter.bandwidth,
                 start_time: transmitter.start_time,
                 buffer: buffer_file,
+                beam: transmitter
+                    .beam
+                    .as_ref()
+                    .map(|beam| beam_writer.spec(beam))
+                    .transpose()?,
             },
+            attitude: (calibrator.attitude != Attitude::default())
+                .then(|| calibrator.attitude.into()),
         });
     }
 
     let file = std::fs::File::create(path)
-        .map_err(|e| PyIOError::new_err(format!("Failed to create file '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to create file '{}': {}", filepath, e)))?;
 
     let writer = std::io::BufWriter::new(file);
 
     serde_json::to_writer_pretty(writer, &entries)
-        .map_err(|e| PyIOError::new_err(format!("Failed to serialize calibrators: {}", e)))?;
+        .map_err(|e| Error::new(format!("Failed to serialize calibrators: {}", e)))?;
 
     Ok(())
 }
@@ -672,24 +812,24 @@ pub fn save_calibrators(calibrators: Vec<Calibrator>, filepath: &str) -> PyResul
 /// A reconstructed list of `Calibrator`s.
 ///
 /// # Errors
-/// Returns a Python `IOError` if a file cannot be read or parsed.
+/// Returns an `Error` (an `IOError` in Python) if a file cannot be read or parsed.
 ///
 /// # Panics
 /// Panics if, for a `Calibrator`:
 /// - a kinematic parameter is not finite
 /// - a transmitter parameter is invalid
 #[pyfunction]
-pub fn load_calibrators(filepath: &str) -> PyResult<Vec<Calibrator>> {
+pub fn load_calibrators(filepath: &str) -> Result<Vec<Calibrator>, Error> {
     let path = Path::new(filepath);
     let directory = path.parent().unwrap_or(Path::new(""));
 
     let file = std::fs::File::open(path)
-        .map_err(|e| PyIOError::new_err(format!("Failed to open file '{}': {}", filepath, e)))?;
+        .map_err(|e| Error::new(format!("Failed to open file '{}': {}", filepath, e)))?;
 
     let reader = std::io::BufReader::new(file);
 
     let entries: Vec<CalibratorJson> = serde_json::from_reader(reader)
-        .map_err(|e| PyIOError::new_err(format!("Failed to deserialize calibrators: {}", e)))?;
+        .map_err(|e| Error::new(format!("Failed to deserialize calibrators: {}", e)))?;
 
     let mut buffers: Vec<(String, Arc<[Complex32]>)> = Vec::new();
     let mut calibrators = Vec::with_capacity(entries.len());
@@ -710,6 +850,11 @@ pub fn load_calibrators(filepath: &str) -> PyResult<Vec<Calibrator>> {
             bandwidth: entry.transmitter.bandwidth,
             buffer,
             start_time: entry.transmitter.start_time,
+            beam: entry
+                .transmitter
+                .beam
+                .map(|spec| spec.resolve(directory))
+                .transpose()?,
         };
         let calibrator = Calibrator {
             position: entry.position,
@@ -717,6 +862,7 @@ pub fn load_calibrators(filepath: &str) -> PyResult<Vec<Calibrator>> {
             acceleration: entry.acceleration,
             epoch: entry.epoch,
             transmitter,
+            attitude: entry.attitude.map(Attitude::from).unwrap_or_default(),
         };
         calibrator.validate();
         calibrators.push(calibrator);
@@ -732,16 +878,15 @@ pub fn load_calibrators(filepath: &str) -> PyResult<Vec<Calibrator>> {
 /// - `samples`: The samples.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be created or written
-fn write_cf32(path: &Path, samples: &[Complex32]) -> PyResult<()> {
+/// Returns an `Error` (an `IOError` in Python) if the file cannot be created or written.
+pub(crate) fn write_cf32(path: &Path, samples: &[Complex32]) -> Result<(), Error> {
     let bytes = samples
         .iter()
         .flat_map(|s| [s.re.to_le_bytes(), s.im.to_le_bytes()])
         .flatten()
         .collect::<Vec<u8>>();
-    std::fs::write(path, bytes).map_err(|e| {
-        PyIOError::new_err(format!("Failed to write file '{}': {}", path.display(), e))
-    })
+    std::fs::write(path, bytes)
+        .map_err(|e| Error::new(format!("Failed to write file '{}': {}", path.display(), e)))
 }
 
 /// Reads samples from a raw interleaved little-endian 32-bit float IQ file.
@@ -753,13 +898,13 @@ fn write_cf32(path: &Path, samples: &[Complex32]) -> PyResult<()> {
 /// The samples.
 ///
 /// # Errors
-/// Returns a Python `IOError` if the file cannot be read or its size is not a multiple of 8 bytes.
-fn read_cf32(path: &Path) -> PyResult<Vec<Complex32>> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        PyIOError::new_err(format!("Failed to read file '{}': {}", path.display(), e))
-    })?;
+/// Returns an `Error` (an `IOError` in Python) if the file cannot be read or its size is
+/// not a multiple of 8 bytes.
+pub(crate) fn read_cf32(path: &Path) -> Result<Vec<Complex32>, Error> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::new(format!("Failed to read file '{}': {}", path.display(), e)))?;
     if bytes.len() % 8 != 0 {
-        return Err(PyIOError::new_err(format!(
+        return Err(Error::new(format!(
             "File '{}' is not a cf32 file: its size is not a multiple of 8 bytes",
             path.display()
         )));
@@ -804,8 +949,30 @@ mod tests {
         let path = directory.join("sources.csv");
 
         let sources = vec![
-            Source::new(Vec3::from_ra_dec(1.0, 0.5), 75e6, 2.0, -0.7, -0.3, 0.1),
-            Source::new(Vec3::from_ra_dec(2.0, -0.2), 50e6, 0.5, 0.0, 0.0, 0.0),
+            Source::new(
+                Vec3::from_ra_dec(1.0, 0.5),
+                75e6,
+                2.0,
+                -0.7,
+                -0.3,
+                0.1,
+                0.4,
+                1.2,
+                -0.1,
+                3.5,
+            ),
+            Source::new(
+                Vec3::from_ra_dec(2.0, -0.2),
+                50e6,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ),
         ];
         save_sources(sources.clone(), path.to_str().unwrap()).unwrap();
         let loaded = load_sources(path.to_str().unwrap()).unwrap();
@@ -818,6 +985,10 @@ mod tests {
             assert_eq!(a.spectral_index, b.spectral_index);
             assert_eq!(a.spectral_index_2, b.spectral_index_2);
             assert_eq!(a.spectral_index_3, b.spectral_index_3);
+            assert_eq!(a.polarization_fraction, b.polarization_fraction);
+            assert_eq!(a.polarization_angle, b.polarization_angle);
+            assert_eq!(a.circular_fraction, b.circular_fraction);
+            assert_eq!(a.rotation_measure, b.rotation_measure);
         }
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -846,6 +1017,117 @@ mod tests {
     }
 
     #[test]
+    fn array_noise_temperature() {
+        let directory =
+            std::env::temp_dir().join(format!("fringe-test-noise-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("array.json");
+        let header = r#""sample_frequency": 120000000.0, "downmix_frequency": 0.0,
+            "bandpass": [15000000.0, 45000000.0], "sample_window_size": 4096,
+            "antenna_positions": [{"x": 0.0, "y": 0.0, "z": 0.0}]"#;
+        let load = |noise: &str| {
+            std::fs::write(&path, format!("{{{header}, {noise}}}")).unwrap();
+            load_array(path.to_str().unwrap())
+        };
+
+        // files written before noise temperatures give k_B T in Jy m²
+        let legacy = load(r#""system_noise_intensity": 13806490.0"#).unwrap();
+        let t = legacy.system_noise_temperature_at(30e6);
+        assert!((t - 10000.0).abs() < 1e-6, "{t}");
+        assert!((legacy.system_noise_intensity(30e6) - 13806490.0).abs() < 1e-3);
+
+        let constant = load(r#""system_noise_temperature": 300"#).unwrap();
+        assert_eq!(
+            constant.system_noise_temperature,
+            NoiseTemperature::Constant(300.0)
+        );
+
+        let table = NoiseTemperature::Table(vec![[10e6, 4000.0], [50e6, 1000.0]]);
+        let tabulated =
+            load(r#""system_noise_temperature": [[10e6, 4000], [50e6, 1000]]"#).unwrap();
+        assert_eq!(tabulated.system_noise_temperature, table);
+        save_array(&tabulated, path.to_str().unwrap()).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("system_noise_intensity"));
+        let reloaded = load_array(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.system_noise_temperature, table);
+
+        assert!(load(r#""horizon": null"#).is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn array_round_trip() {
+        use crate::library::beam::tests::tabulate;
+        let directory =
+            std::env::temp_dir().join(format!("fringe-test-array-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("array.json");
+
+        let beam = tabulate(&Beam::short_dipole(), &[10e6, 60e6], 10.0, 10.0);
+        let mut array = Array::dual_polarized(
+            vec![Vec3::new(1.0, 2.0, 0.0), Vec3::new(-3.0, 0.5, 0.1)],
+            120e6,
+            0.0,
+            20e6,
+            50e6,
+            1024,
+            NoiseTemperature::Table(vec![[10e6, 3000.0], [60e6, 1500.0]]),
+            Some(beam.clone()),
+            Some(vec![
+                Orientation::identity(),
+                Orientation::new(Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0)),
+            ]),
+            Some(Vec3::new(0.0, 0.0, 2.0)),
+        );
+        array.beams.extend([Beam::cos_squared(), beam]);
+        array.antenna_beams = vec![0, 0, 1, 2];
+        save_array(&array, path.to_str().unwrap()).unwrap();
+        let loaded = load_array(path.to_str().unwrap()).unwrap();
+
+        // the two references to the tabulated beam share a file
+        assert!(directory.join("array.beam0.json").exists());
+        assert!(!directory.join("array.beam1.json").exists());
+        assert_eq!(loaded.beams.len(), 3);
+        assert_eq!(loaded.beams[1].kind(), "cos_squared");
+        assert_eq!(loaded.antenna_beams, array.antenna_beams);
+        assert_eq!(loaded.horizon, Some(Vec3::new(0.0, 0.0, 1.0)));
+        assert_eq!(
+            loaded.system_noise_temperature,
+            array.system_noise_temperature
+        );
+        for (a, b) in loaded
+            .antenna_orientations
+            .iter()
+            .zip(&array.antenna_orientations)
+        {
+            assert!((a.boresight() - b.boresight()).norm() < 1e-12);
+            assert!((a.reference() - b.reference()).norm() < 1e-12);
+        }
+        let direction = Vec3::new(0.3, 0.1, 0.9);
+        assert!(
+            (loaded.beams[0].gain(direction, 30e6) - array.beams[0].gain(direction, 30e6)).abs()
+                < 1e-6
+        );
+
+        // arrays with the default beam are written as before
+        let legacy = Array {
+            beams: vec![Beam::cos_squared()],
+            antenna_beams: Vec::new(),
+            antenna_orientations: Vec::new(),
+            horizon: None,
+            ..array
+        };
+        save_array(&legacy, path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("beams") && !text.contains("horizon"));
+        assert_eq!(load_array(path.to_str().unwrap()).unwrap().beams.len(), 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn calibrators_round_trip() {
         let directory = std::env::temp_dir().join(format!("fringe-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -858,6 +1140,7 @@ mod tests {
             vec![Complex32::new(1.0, -0.5), Complex32::new(-0.25, 0.75)],
             Some(15e6),
             0.5,
+            None,
         );
         let calibrators = vec![
             Calibrator::new(
@@ -866,8 +1149,35 @@ mod tests {
                 Some(Vec3::new(4.0, 5.0, 6.0)),
                 Some(Vec3::new(7.0, 8.0, 9.0)),
                 10.0,
+                None,
             ),
-            Calibrator::new(Vec3::new(-1.0, 0.0, 1e5), shared, None, None, 0.0),
+            Calibrator::new(
+                Vec3::new(-1.0, 0.0, 1e5),
+                shared.clone(),
+                None,
+                None,
+                0.0,
+                None,
+            ),
+            Calibrator::new(
+                Vec3::new(5.0, 0.0, 1e5),
+                Transmitter {
+                    beam: Some(crate::library::beam::tests::tabulate(
+                        &Beam::short_dipole(),
+                        &[70e6, 80e6],
+                        10.0,
+                        10.0,
+                    )),
+                    ..shared
+                },
+                None,
+                None,
+                0.0,
+                Some(Attitude::point_at(
+                    Vec3::default(),
+                    Vec3::new(1.0, 0.0, 0.0),
+                )),
+            ),
         ];
         save_calibrators(calibrators.clone(), path.to_str().unwrap()).unwrap();
         let loaded = load_calibrators(path.to_str().unwrap()).unwrap();
@@ -890,7 +1200,13 @@ mod tests {
             assert_eq!(a.transmitter.bandwidth, b.transmitter.bandwidth);
             assert_eq!(a.transmitter.start_time, b.transmitter.start_time);
             assert_eq!(a.transmitter.buffer, b.transmitter.buffer);
+            assert_eq!(a.attitude, b.attitude);
+            assert_eq!(
+                a.transmitter.beam.as_ref().map(|b| b.kind()),
+                b.transmitter.beam.as_ref().map(|b| b.kind())
+            );
         }
+        assert!(directory.join("calibrators.beam0.json").exists());
 
         std::fs::remove_dir_all(directory).unwrap();
     }

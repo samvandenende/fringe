@@ -64,12 +64,12 @@ struct Input {
 fn main() {
     let input = Input::parse();
 
-    let array = load_array(&input.array).expect("Failed to load array");
-    let sources = load_sources(&input.sources).expect("Failed to load sources");
-    let calibrators = input
-        .calibrators
-        .as_ref()
-        .map(|path| load_calibrators(path).expect("Failed to load calibrators"));
+    let array = load_array(&input.array).unwrap_or_else(|e| panic!("Failed to load array: {e}"));
+    let sources =
+        load_sources(&input.sources).unwrap_or_else(|e| panic!("Failed to load sources: {e}"));
+    let calibrators = input.calibrators.as_ref().map(|path| {
+        load_calibrators(path).unwrap_or_else(|e| panic!("Failed to load calibrators: {e}"))
+    });
 
     let mut simulation = Simulation::new(
         input.runtime,

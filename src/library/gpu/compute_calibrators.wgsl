@@ -17,7 +17,12 @@ struct Segment {
     buffer_index: u32,
     buffer_frac: f32,
     carrier: f32,
-    amplitude: f32,
+    // complex received amplitude
+    amplitude_re: f32,
+    amplitude_im: f32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
     delay_s: vec4<f32>,
 };
 
@@ -29,8 +34,9 @@ struct Params {
     segment_half_len: f32,
     // number of samples before the first output sample
     offset: u32,
-    _p0: u32,
-    _p1: u32,
+    // range of calibrators to evaluate
+    calibrator_begin: u32,
+    calibrator_end: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -78,7 +84,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = (local - f32(params.segment_len - 1u) / 2.0) / params.segment_half_len;
 
     var sum = vec2<f32>(0.0, 0.0);
-    for (var c = 0u; c < params.num_calibrators; c++) {
+    for (var c = params.calibrator_begin; c < params.calibrator_end; c++) {
         let calibrator = calibrators[c];
         let sample = common_samples[c * params.num_bins + m];
         let segment = segments[(receiver_idx * params.num_calibrators + c) * params.num_segments + segment_idx];
@@ -103,7 +109,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             + w3 * buffer_sample(calibrator, index + 2);
 
         let phase = TAU * fract(sample.carrier - segment.carrier - calibrator.frequency_hz * delay);
-        sum += complex_mul(value, vec2<f32>(cos(phase), sin(phase))) * segment.amplitude;
+        let amplitude = vec2<f32>(segment.amplitude_re, segment.amplitude_im);
+        sum += complex_mul(complex_mul(value, vec2<f32>(cos(phase), sin(phase))), amplitude);
     }
 
     signal[receiver_idx * params.num_bins + m] = sum * taper(m);

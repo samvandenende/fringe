@@ -26,9 +26,9 @@ POSITION = fr.Vec3(2e4, -1e4, 1e5)  # m
 VELOCITY = fr.Vec3(1600.0, 0.0, 0.0)  # m/s
 ACCELERATION = fr.Vec3(0.0, 0.0, -1.47)  # m/s², centripetal acceleration of the orbit
 
-# System noise k_B T_sys in Jy m² (T_sys of about 1.8e6 K), chosen for a
-# signal-to-noise ratio of about -4 dB per sample.
-SYSTEM_NOISE_INTENSITY = 2.5e9
+# System noise temperature (K), chosen for a signal-to-noise ratio of about -4 dB per
+# sample.
+SYSTEM_NOISE_TEMPERATURE = 1.81e6
 
 
 with open(ARRAY_FILE) as f:
@@ -36,7 +36,7 @@ with open(ARRAY_FILE) as f:
 antenna_positions = [fr.Vec3(p["x"], p["y"], p["z"]) for p in array_json["antenna_positions"]]
 
 
-def make_array(system_noise_intensity):
+def make_array(system_noise_temperature):
     return fr.Array(
         antenna_positions,
         array_json["sample_frequency"],
@@ -44,11 +44,11 @@ def make_array(system_noise_intensity):
         array_json["bandpass"][0],
         array_json["bandpass"][1],
         array_json["sample_window_size"],
-        system_noise_intensity,
+        system_noise_temperature,
     )
 
 
-array = make_array(SYSTEM_NOISE_INTENSITY)
+array = make_array(SYSTEM_NOISE_TEMPERATURE)
 sample_frequency = array.sample_frequency()
 sample_window_size = array.sample_window_size()
 
